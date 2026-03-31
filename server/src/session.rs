@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use {
+    crate::grpc::relay::ServerEvent,
+    dashmap::DashMap,
+    std::{sync::Arc, time::Instant},
+    tokio::sync::mpsc,
+};
+
+/// 服务端会话，代表一次 PC 客户端发起的 gRPC Subscribe 调用。
+///
+/// 每次 Subscribe 调用会生成一个新令牌并创建一个 Session，存储在 [`SessionStore`] 中。
+/// 手机扫码后通过 WebSocket 与该 Session 绑定的 PC 客户端通信。
+pub struct Session {
+    /// 会话令牌（UUID v4 字符串），同时也是 SessionStore 的 key。
+    #[allow(dead_code)]
+    pub token: String,
+    /// 会话创建时刻，用于计算是否超过 `token_expiry_secs`。
+    pub created_at: Instant,
+    /// 是否已被手机端扫描过。令牌一旦扫描即置为 `true`，防止重复使用。
+    pub scanned: bool,
+    /// 手机端发起 WebSocket 升级时记录的预留时刻。
+    ///
+    /// 用于在升级完成前阻止其他扫码请求，超过 `UPGRADE_RESERVATION_TIMEOUT_SECS` 后预留自动失效。
+    pub upgrade_reserved_at: Option<Instant>,
+    /// WebSocket 连接是否活跃。`handle_ws` 建立后置为 `true`，连接断开时由 SessionGuard 清理整个
+    /// Session。
+    pub ws_active: bool,
+    /// 向 PC 客户端 gRPC 流发送事件的通道发送端。
+    ///
+    /// 手机端发来消息时，服务端通过此通道将事件推送给 PC 客户端。
+    pub client_tx: Option<mpsc::Sender<Result<ServerEvent, tonic::Status>>>,
+    /// 向手机端 WebSocket 发送控制指令的无界通道发送端。
+    ///
+    /// 目前用于在 PC 客户端断开时向手机端推送断开通知。`None` 表示手机端尚未建立 WebSocket。
+    pub mobile_control_tx: Option<mpsc::UnboundedSender<String>>,
+    /// 手机端设备信息（通常为握手时采集的 User-Agent）。
+    pub device_info: Option<String>,
+}
+
+/// 线程安全的会话存储，key 为令牌字符串，value 为 [`Session`]。
+///
+/// 由 `Arc<DashMap>` 组成，可在多个 tokio 任务间安全共享。
+pub type SessionStore = Arc<DashMap<String, Session>>;
+
+/// 创建一个空的 [`SessionStore`]。
+pub fn new_store() -> SessionStore { Arc::new(DashMap::new()) }

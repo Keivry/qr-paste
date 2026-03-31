@@ -1,0 +1,203 @@
+<!-- SPDX-License-Identifier: MIT OR Apache-2.0 -->
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
+    />
+    <title>发送文字到 PC</title>
+    <style>
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #f5f5f5;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        padding: 16px;
+      }
+      #status {
+        padding: 10px 14px;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 500;
+        margin-bottom: 16px;
+        text-align: center;
+      }
+      .status-connecting {
+        background: #fff3cd;
+        color: #856404;
+      }
+      .status-connected {
+        background: #d1e7dd;
+        color: #0a3622;
+      }
+      .status-error {
+        background: #f8d7da;
+        color: #58151c;
+      }
+      textarea {
+        width: 100%;
+        flex: 1;
+        min-height: 180px;
+        padding: 12px;
+        font-size: 16px;
+        border: 1.5px solid #ccc;
+        border-radius: 8px;
+        resize: vertical;
+        outline: none;
+        background: #fff;
+        transition: border-color 0.2s;
+      }
+      textarea:focus {
+        border-color: #0d6efd;
+      }
+      #send-btn {
+        display: block;
+        width: 100%;
+        margin-top: 12px;
+        padding: 14px;
+        font-size: 17px;
+        font-weight: 600;
+        color: #fff;
+        background: #0d6efd;
+        border: none;
+        border-radius: 8px;
+        cursor: pointer;
+        min-height: 44px;
+        transition:
+          background 0.2s,
+          opacity 0.2s;
+      }
+      #send-btn:disabled {
+        background: #adb5bd;
+        cursor: not-allowed;
+      }
+      #send-btn:not(:disabled):active {
+        background: #0a58ca;
+      }
+      #toast {
+        position: fixed;
+        bottom: 24px;
+        left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0, 0, 0, 0.75);
+        color: #fff;
+        padding: 8px 20px;
+        border-radius: 20px;
+        font-size: 14px;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.3s;
+      }
+      #toast.show {
+        opacity: 1;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status" class="status-connecting">连接中...</div>
+    <textarea
+      id="input"
+      placeholder="输入要发送到 PC 的文本..."
+      disabled
+    ></textarea>
+    <button id="send-btn" disabled>发送</button>
+    <div id="toast"></div>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const inputEl = document.getElementById("input");
+      const sendBtn = document.getElementById("send-btn");
+      const toastEl = document.getElementById("toast");
+
+      let toastTimer = null;
+      function showToast(msg) {
+        toastEl.textContent = msg;
+        toastEl.classList.add("show");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2000);
+      }
+
+      function setStatus(text, cls) {
+        statusEl.textContent = text;
+        statusEl.className = "status-" + cls;
+      }
+
+      function updateSendButton() {
+        sendBtn.disabled = inputEl.disabled || inputEl.value.trim() === "";
+      }
+
+      function setInputEnabled(ok) {
+        inputEl.disabled = !ok;
+        updateSendButton();
+      }
+
+      const token = location.pathname.split("/").pop();
+      const wsProto = location.protocol === "https:" ? "wss" : "ws";
+      const wsUrl = `${wsProto}://${location.host}/ws/mobile/${token}`;
+
+      let ws = new WebSocket(wsUrl);
+      let disconnectedByClient = false;
+
+      ws.addEventListener("open", () => {
+        setStatus("已连接到 PC", "connected");
+        setInputEnabled(true);
+      });
+
+      ws.addEventListener("message", (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "client_disconnected") {
+            disconnectedByClient = true;
+            setStatus("PC 客户端已断开，请重新扫码", "error");
+            setInputEnabled(true);
+            ws.close();
+          } else if (msg.type === "error") {
+            showToast(msg.message || "发送失败");
+          }
+        } catch (error) {
+          console.warn("无法解析服务端消息", error);
+          setStatus("收到无法识别的服务端消息", "error");
+        }
+      });
+
+      ws.addEventListener("close", () => {
+        if (disconnectedByClient) return;
+        setStatus("连接已断开，请重新扫码", "error");
+        setInputEnabled(true);
+      });
+
+      ws.addEventListener("error", () => {
+        setStatus("连接失败，请重新扫码", "error");
+        setInputEnabled(true);
+      });
+
+      inputEl.addEventListener("input", () => {
+        updateSendButton();
+      });
+
+      sendBtn.addEventListener("click", () => {
+        const content = inputEl.value.trim();
+        if (!content) return;
+        if (ws.readyState !== WebSocket.OPEN) {
+          showToast("发送失败：连接已断开");
+          return;
+        }
+        ws.send(JSON.stringify({ type: "clipboard_text", content }));
+        inputEl.value = "";
+        sendBtn.disabled = true;
+        showToast("已发送");
+      });
+    </script>
+  </body>
+</html>

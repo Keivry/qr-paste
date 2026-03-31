@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name for the release, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-server:
+    name: Build Server (Linux x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-ubuntu22
+
+      - name: Build server
+        run: cargo build --release --locked -p server
+
+      - name: Package server archive
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          ARCHIVE="cd-input-server-linux-x86_64-${TAG}.tar.gz"
+          mkdir -p dist
+          cp target/release/server dist/
+          cp server.example.toml dist/
+          cp docs/nginx.conf.example dist/
+          cp docs/haproxy.cfg.example dist/
+          cp LICENSE-MIT dist/
+          cp LICENSE-APACHE dist/
+          tar -czf "${ARCHIVE}" -C dist .
+          echo "ARCHIVE=${ARCHIVE}" >> "${GITHUB_ENV}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-artifact
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  build-client:
+    name: Build Client (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: client-windows
+
+      - name: Build client
+        run: cargo build --release --locked -p client
+
+      - name: Package client archive
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $archive = "cd-input-client-windows-x86_64-${tag}.zip"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/client.exe dist/
+          Copy-Item client.example.toml dist/
+          Copy-Item LICENSE-MIT dist/
+          Copy-Item LICENSE-APACHE dist/
+          Compress-Archive -Path dist/* -DestinationPath $archive
+          echo "ARCHIVE=$archive" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: client-artifact
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: [build-server, build-client]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: "*-artifact"
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.zip
+          generate_release_notes: true

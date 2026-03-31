@@ -1,0 +1,7 @@
+[target.x86_64-pc-windows-gnu]
+image = "ghcr.io/cross-rs/x86_64-pc-windows-gnu:main"
+
+[build]
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends clang lld llvm protobuf-compiler",
+]

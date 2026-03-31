@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+global
+    log stdout format raw local0
+    maxconn 4096
+
+defaults
+    mode http
+    log global
+    option httplog
+    option dontlognull
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+
+frontend fe_http_redirect
+    bind :80
+    http-request redirect scheme https code 301
+
+frontend fe_tls
+    bind :443 ssl crt /etc/haproxy/certs/example.pem alpn h2,http/1.1
+
+    acl host_relay hdr(host) -i example.com
+    acl host_grpc hdr(host) -i grpc.example.com
+    acl is_mobile_ws path_beg /ws/mobile/
+
+    use_backend be_relay_ws if host_relay is_mobile_ws
+    use_backend be_relay_http if host_relay
+    use_backend be_relay_grpc if host_grpc
+
+    http-request deny deny_status 404
+
+backend be_relay_http
+    option forwardfor
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+    http-request set-header X-Forwarded-Host %[req.hdr(Host)]
+    server relay_http 127.0.0.1:8080 check
+
+backend be_relay_ws
+    option forwardfor
+    option http-server-close
+    timeout tunnel 2m
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+    http-request set-header X-Forwarded-Host %[req.hdr(Host)]
+    server relay_ws 127.0.0.1:8080 check
+
+backend be_relay_grpc
+    option forwardfor
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+    http-request set-header X-Forwarded-Host %[req.hdr(Host)]
+    server relay_grpc 127.0.0.1:50051 check proto h2

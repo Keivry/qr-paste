@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+syntax = "proto3";
+package relay;
+
+service ClientRelay {
+  rpc Subscribe(SubscribeRequest) returns (stream ServerEvent);
+}
+
+message SubscribeRequest {
+  string auth_token = 1;
+}
+
+message ServerEvent {
+  oneof event {
+    SessionToken session_token = 1;
+    MobileConnected mobile_connected = 2;
+    MobileDisconnected mobile_disconnected = 3;
+    ClipboardText clipboard_text = 4;
+    Ping ping = 5;
+  }
+}
+
+message SessionToken {
+  string token = 1;
+  string url = 2;
+}
+
+message MobileConnected {
+  string device_info = 1;
+}
+
+message MobileDisconnected {}
+
+message ClipboardText {
+  string content = 1;
+}
+
+message Ping {}

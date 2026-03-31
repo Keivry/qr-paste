@@ -1,0 +1,51 @@
+# 必填：服务端对外可访问的基础 URL（不带尾部斜线）
+public_base_url = "https://example.com"
+
+# 必填：gRPC 鉴权令牌，客户端必须提供完全一致的值
+# 注意：该令牌会明文保存在本地配置文件中，请勿提交到仓库
+grpc_auth_token = "change-this-long-random-token"
+
+# gRPC 端口（Windows 客户端连接）
+grpc_port = 50051
+
+# HTTP 端口（手机浏览器访问）
+http_port = 8080
+
+# HTTP/WebSocket 监听地址，默认 127.0.0.1；若需直接监听所有网卡可改为 0.0.0.0
+http_bind_host = "127.0.0.1"
+
+# gRPC 监听地址，默认 127.0.0.1；强烈建议只在反向代理或受信网络后暴露
+grpc_bind_host = "127.0.0.1"
+
+# 令牌有效期（秒），默认 300（5 分钟）
+token_expiry_secs = 300
+
+# 令牌清理间隔（秒），默认 60
+token_cleanup_interval_secs = 60
+
+# 每 IP 每分钟 WebSocket 连接次数限制，默认 10
+ws_rate_limit_per_ip_per_min = 10
+
+# 每 IP 每分钟 HTTP 请求次数限制，默认 20
+http_rate_limit_per_ip_per_min = 20
+
+# 全局最大 WebSocket 并发连接数，默认 100
+max_ws_connections = 100
+
+# 单条 WebSocket 消息最大字节数，默认 65536（64KB）
+max_message_size_bytes = 65536
+
+# WebSocket 空闲超时（秒），默认 90
+ws_idle_timeout_secs = 90
+
+# gRPC keepalive 心跳间隔（秒），默认 30
+grpc_keepalive_interval_secs = 30
+
+# gRPC keepalive 超时（秒），默认 20
+grpc_keepalive_timeout_secs = 20
+
+# 日志级别：trace / debug / info / warn / error，默认 info
+log_level = "info"
+
+# 若部署在可信反向代理之后并希望按 X-Forwarded-For / X-Real-IP 限流，可设为 true
+behind_trusted_proxy = false

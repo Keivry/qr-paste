@@ -1,0 +1,36 @@
+# client 会优先读取 client.exe 同目录下的 client.toml；
+# 若不存在，则回退到当前工作目录。
+
+# 必填：服务端主机名 / IP，或完整 gRPC 入口 URL
+# 直连示例："example.com"
+# 经 HTTPS/TLS 反向代理（如 nginx/HAProxy）示例："https://grpc.example.com"
+server_host = "example.com"
+
+# 必填：gRPC 鉴权令牌，必须与 server.toml 中的 grpc_auth_token 一致
+# 注意：该令牌会明文保存在本地配置文件中，请勿提交到仓库
+grpc_auth_token = "change-this-long-random-token"
+
+# gRPC 端口：裸主机名 / http:// 默认 50051；https:// 默认 443；当 server_host 已显式包含端口时会被忽略
+# 如需覆盖默认值可取消注释，例如：
+# grpc_port = 50051
+
+# 是否启用自动粘贴（收到文本后模拟 Ctrl+V），默认 false
+auto_paste = false
+
+# 自动粘贴前的延迟毫秒数（等待剪贴板写入完成），默认 150
+paste_delay_ms = 150
+
+# gRPC 断连后重连间隔（秒），默认 5
+reconnect_interval_secs = 5
+
+# 最大重连次数，0 表示无限重试，默认 0
+max_reconnect_attempts = 0
+
+# 启动时是否最小化到托盘，默认 false
+start_minimized = false
+
+# 点击窗口关闭按钮时是否最小化到托盘而不是退出，默认 false
+minimize_on_close = false
+
+# 粘贴成功通知显示时长（秒），默认 3
+notification_duration_secs = 3
