@@ -39,9 +39,9 @@ jobs:
       - name: Package server archive
         run: |
           TAG="${GITHUB_REF_NAME}"
-          ARCHIVE="cd-input-server-linux-x86_64-${TAG}.tar.gz"
+          ARCHIVE="qr-paste-server-linux-x86_64-${TAG}.tar.gz"
           mkdir -p dist
-          cp target/release/server dist/
+          cp target/release/qr-paste-server dist/
           cp server.example.toml dist/
           cp docs/nginx.conf.example dist/
           cp docs/haproxy.cfg.example dist/
@@ -80,9 +80,9 @@ jobs:
         shell: pwsh
         run: |
           $tag = $env:GITHUB_REF_NAME
-          $archive = "cd-input-client-windows-x86_64-${tag}.zip"
+          $archive = "qr-paste-client-windows-x86_64-${tag}.zip"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/client.exe dist/
+          Copy-Item target/release/qr-paste-client.exe dist/
           Copy-Item client.example.toml dist/
           Copy-Item LICENSE-MIT dist/
           Copy-Item LICENSE-APACHE dist/

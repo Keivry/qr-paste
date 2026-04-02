@@ -132,27 +132,16 @@ where
     );
 
     {
-        let limiter = http_rate_limit.limiter().clone();
+        let http_limiter = http_rate_limit.limiter().clone();
+        let ws_limiter = ws_rate_limit.limiter().clone();
         // 复用 token_cleanup_interval_secs 作为限速器清理周期，避免引入额外配置项
         let interval_secs = config.token_cleanup_interval_secs.max(1);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
-                limiter.retain_recent();
-            }
-        });
-    }
-
-    {
-        let limiter = ws_rate_limit.limiter().clone();
-        // 同上，复用 token_cleanup_interval_secs 作为 WS 限速器清理周期
-        let interval_secs = config.token_cleanup_interval_secs.max(1);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-            loop {
-                interval.tick().await;
-                limiter.retain_recent();
+                http_limiter.retain_recent();
+                ws_limiter.retain_recent();
             }
         });
     }
@@ -334,7 +323,7 @@ async fn handle_ws(
                                 if content.is_empty() {
                                     continue;
                                 }
-                                match connected_tx.clone() {
+                                match &connected_tx {
                                     None => {
                                         let message = serialize_mobile_message(
                                             &ServerToMobileMessage::ClientDisconnected,
@@ -365,9 +354,11 @@ async fn handle_ws(
         }
     }
 
-    if let Some(session) = state.store.get(&token)
-        && let Some(tx) = session.client_tx.clone()
-    {
+    let disconnect_tx = state
+        .store
+        .get(&token)
+        .and_then(|session| session.client_tx.clone());
+    if let Some(tx) = disconnect_tx {
         let event = ServerEvent {
             event: Some(Event::MobileDisconnected(MobileDisconnected {})),
         };

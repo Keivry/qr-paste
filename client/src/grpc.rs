@@ -433,17 +433,10 @@ async fn connect_client(
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
 
     if let Some(domain) = &endpoint_config.tls_domain {
-        let tls_config = if cfg!(target_os = "windows") {
-            ClientTlsConfig::new()
-                .with_webpki_roots()
-                .domain_name(domain.clone())
-                .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        } else {
-            ClientTlsConfig::new()
-                .with_native_roots()
-                .domain_name(domain.clone())
-                .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        };
+        let tls_config = ClientTlsConfig::new()
+            .with_webpki_roots()
+            .domain_name(domain.clone())
+            .timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
         endpoint = endpoint
             .tls_config(tls_config)
             .map_err(|err| format!("gRPC TLS 配置失败：{err}"))?;
