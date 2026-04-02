@@ -87,6 +87,24 @@ impl ClientRelay for ClientRelayService {
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let remote_addr = request.remote_addr();
+        let display_addr: String = if self.config.behind_trusted_proxy {
+            let xff = request
+                .metadata()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(str::trim);
+            let xri = request
+                .metadata()
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim);
+            xff.or(xri)
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| format!("{remote_addr:?}"))
+        } else {
+            format!("{remote_addr:?}")
+        };
         if !bool::from(
             request
                 .get_ref()
@@ -94,7 +112,7 @@ impl ClientRelay for ClientRelayService {
                 .as_bytes()
                 .ct_eq(self.config.grpc_auth_token.as_bytes()),
         ) {
-            warn!("Rejected unauthenticated gRPC subscribe from {remote_addr:?}");
+            warn!("Rejected unauthenticated gRPC subscribe from {display_addr}");
             return Err(Status::unauthenticated("invalid gRPC auth token"));
         }
 
@@ -115,7 +133,7 @@ impl ClientRelay for ClientRelayService {
         };
 
         self.store.insert(token.clone(), session);
-        info!("Created session token for gRPC client {remote_addr:?}");
+        info!("Created session token for gRPC client {display_addr}");
 
         let first_event = ServerEvent {
             event: Some(relay::server_event::Event::SessionToken(SessionToken {
