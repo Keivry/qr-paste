@@ -44,6 +44,7 @@ enum AppState {
 struct ClipboardJob {
     content: String,
     auto_paste: bool,
+    enter_after_paste: bool,
     paste_delay_ms: u64,
     notice_content: String,
 }
@@ -180,6 +181,7 @@ impl eframe::App for App {
                     let _ = self.clipboard_job_tx.send(ClipboardJob {
                         content,
                         auto_paste: self.config.auto_paste,
+                        enter_after_paste: self.config.enter_after_paste,
                         paste_delay_ms: self.config.paste_delay_ms,
                         notice_content,
                     });
@@ -284,9 +286,14 @@ fn start_clipboard_worker(
 
             if job.auto_paste {
                 clipboard::simulate_paste(job.paste_delay_ms);
+                if job.enter_after_paste {
+                    clipboard::simulate_enter_key();
+                }
             }
 
-            let notice = if job.auto_paste {
+            let notice = if job.auto_paste && job.enter_after_paste {
+                format!("已自动粘贴并回车：{}", job.notice_content)
+            } else if job.auto_paste {
                 format!("已自动粘贴：{}", job.notice_content)
             } else {
                 format!("已复制到剪贴板：{}", job.notice_content)

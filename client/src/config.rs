@@ -27,6 +27,8 @@ pub struct ClientConfig {
     /// 对裸主机名 / `http://` 地址默认使用 `50051`，对 `https://` 地址默认使用 `443`。
     pub grpc_port: u16,
     pub auto_paste: bool,
+    /// `auto_paste` 为 `true` 时，粘贴完成后是否自动按下回车键。默认 `false`。
+    pub enter_after_paste: bool,
     /// 自动粘贴前的等待毫秒数，给剪贴板写入操作留出时间。默认 150 ms。
     pub paste_delay_ms: u64,
     /// gRPC 断开后的重连等待时间（秒）。默认 5 秒。
@@ -44,6 +46,7 @@ pub struct ClientConfig {
 fn default_grpc_port() -> u16 { 50051 }
 fn default_https_grpc_port() -> u16 { 443 }
 fn default_auto_paste() -> bool { false }
+fn default_enter_after_paste() -> bool { false }
 fn default_paste_delay_ms() -> u64 { 150 }
 fn default_reconnect_interval_secs() -> u64 { 5 }
 fn default_max_reconnect_attempts() -> u32 { 0 }
@@ -59,6 +62,8 @@ struct RawClientConfig {
     grpc_port: Option<u16>,
     #[serde(default = "default_auto_paste")]
     auto_paste: bool,
+    #[serde(default = "default_enter_after_paste")]
+    enter_after_paste: bool,
     #[serde(default = "default_paste_delay_ms")]
     paste_delay_ms: u64,
     #[serde(default = "default_reconnect_interval_secs")]
@@ -84,6 +89,7 @@ impl From<RawClientConfig> for ClientConfig {
             grpc_auth_token: raw.grpc_auth_token,
             grpc_port,
             auto_paste: raw.auto_paste,
+            enter_after_paste: raw.enter_after_paste,
             paste_delay_ms: raw.paste_delay_ms,
             reconnect_interval_secs: raw.reconnect_interval_secs,
             max_reconnect_attempts: raw.max_reconnect_attempts,

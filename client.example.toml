@@ -17,6 +17,9 @@ grpc_auth_token = "change-this-long-random-token"
 # 是否启用自动粘贴（收到文本后模拟 Ctrl+V），默认 false
 auto_paste = false
 
+# 自动粘贴后是否自动按下回车键（仅在 auto_paste = true 时生效），默认 false
+enter_after_paste = false
+
 # 自动粘贴前的延迟毫秒数（等待剪贴板写入完成），默认 150
 paste_delay_ms = 150
 

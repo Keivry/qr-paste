@@ -46,3 +46,21 @@ pub fn simulate_paste(delay_ms: u64) {
         tracing::warn!("Failed to release Ctrl for paste: {err}");
     }
 }
+
+/// 模拟按下回车键。
+///
+/// 在自动粘贴完成后调用，用于自动提交表单或确认输入。
+/// 若 `enigo` 初始化失败则记录告警并退出。
+pub fn simulate_enter_key() {
+    use enigo::{Enigo, Key, Keyboard, Settings};
+    let mut enigo = match Enigo::new(&Settings::default()) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!("Enter key simulation unavailable: {err}");
+            return;
+        }
+    };
+    if let Err(err) = enigo.key(Key::Return, enigo::Direction::Click) {
+        tracing::warn!("Failed to send Enter key: {err}");
+    }
+}
