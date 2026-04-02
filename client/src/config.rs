@@ -31,10 +31,6 @@ pub struct ClientConfig {
     pub enter_after_paste: bool,
     /// 自动粘贴前的等待毫秒数，给剪贴板写入操作留出时间。默认 150 ms。
     pub paste_delay_ms: u64,
-    /// gRPC 断开后的重连等待时间（秒）。默认 5 秒。
-    pub reconnect_interval_secs: u64,
-    /// 最大重连尝试次数。`0` 表示无限重试。默认 0。
-    pub max_reconnect_attempts: u32,
     /// 启动时是否隐藏主窗口（仅在托盘显示）。默认 `false`。
     pub start_minimized: bool,
     /// 点击窗口关闭按钮时是否最小化到托盘而不是退出。默认 `false`。
@@ -48,8 +44,6 @@ fn default_https_grpc_port() -> u16 { 443 }
 fn default_auto_paste() -> bool { false }
 fn default_enter_after_paste() -> bool { false }
 fn default_paste_delay_ms() -> u64 { 150 }
-fn default_reconnect_interval_secs() -> u64 { 5 }
-fn default_max_reconnect_attempts() -> u32 { 0 }
 fn default_start_minimized() -> bool { false }
 fn default_minimize_on_close() -> bool { false }
 fn default_notification_duration_secs() -> u64 { 3 }
@@ -66,10 +60,6 @@ struct RawClientConfig {
     enter_after_paste: bool,
     #[serde(default = "default_paste_delay_ms")]
     paste_delay_ms: u64,
-    #[serde(default = "default_reconnect_interval_secs")]
-    reconnect_interval_secs: u64,
-    #[serde(default = "default_max_reconnect_attempts")]
-    max_reconnect_attempts: u32,
     #[serde(default = "default_start_minimized")]
     start_minimized: bool,
     #[serde(default = "default_minimize_on_close")]
@@ -91,8 +81,6 @@ impl From<RawClientConfig> for ClientConfig {
             auto_paste: raw.auto_paste,
             enter_after_paste: raw.enter_after_paste,
             paste_delay_ms: raw.paste_delay_ms,
-            reconnect_interval_secs: raw.reconnect_interval_secs,
-            max_reconnect_attempts: raw.max_reconnect_attempts,
             start_minimized: raw.start_minimized,
             minimize_on_close: raw.minimize_on_close,
             notification_duration_secs: raw.notification_duration_secs,
@@ -232,8 +220,6 @@ mod tests {
         assert_eq!(cfg.grpc_port, 50051);
         assert!(!cfg.auto_paste);
         assert_eq!(cfg.paste_delay_ms, 150);
-        assert_eq!(cfg.reconnect_interval_secs, 5);
-        assert_eq!(cfg.max_reconnect_attempts, 0);
         assert!(!cfg.start_minimized);
         assert!(!cfg.minimize_on_close);
         assert_eq!(cfg.notification_duration_secs, 3);
@@ -248,7 +234,6 @@ mod tests {
             grpc_port = 9090
             auto_paste = false
             paste_delay_ms = 300
-            max_reconnect_attempts = 5
             start_minimized = true
             minimize_on_close = true
             notification_duration_secs = 10
@@ -259,12 +244,9 @@ mod tests {
         assert_eq!(cfg.grpc_port, 9090);
         assert!(!cfg.auto_paste);
         assert_eq!(cfg.paste_delay_ms, 300);
-        assert_eq!(cfg.max_reconnect_attempts, 5);
         assert!(cfg.start_minimized);
         assert!(cfg.minimize_on_close);
         assert_eq!(cfg.notification_duration_secs, 10);
-        // 未覆盖的字段仍使用默认值
-        assert_eq!(cfg.reconnect_interval_secs, 5);
     }
 
     #[test]

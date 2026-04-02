@@ -7,40 +7,34 @@ use {
         grpc::{self, ClientEvent},
         tray,
     },
-    egui::{ColorImage, Context, TextureHandle, ViewportCommand},
+    egui::{
+        Align2, Color32, ColorImage, Context, FontId, Rect, Sense, TextureHandle, ViewportCommand,
+        vec2,
+    },
     std::{
         sync::mpsc,
+        sync::mpsc::TryRecvError,
         time::{Duration, Instant},
     },
 };
 
-/// 主窗口的状态机。
-///
-/// 状态转移路径：
-/// `Connecting` → `WaitingScan`（收到 SessionToken）
-/// `WaitingScan` → `Connected`（收到 MobileConnected）
-/// `Connected` → `Connecting`（收到 MobileDisconnected）
-/// 任意状态 → `Error`（gRPC 达到最大重连次数）
 enum AppState {
-    /// 正在连接 gRPC 服务端，或等待服务端分配令牌。
     Connecting,
-    /// 已获取令牌，展示二维码等待手机扫描。
     WaitingScan {
-        /// 预生成的二维码纹理，避免每帧重复计算。
         qr_texture: TextureHandle,
-        /// 二维码对应的 URL，同时在图码下方以文本显示。
         url: String,
     },
-    /// 手机已连接，正在等待用户发送文本。
     Connected {
-        /// 手机端设备信息；当服务端无法获取 User-Agent 时可能为空字符串。
         device_info: String,
     },
-    /// gRPC 不可恢复错误，展示错误信息。
-    Error { message: String },
+    Expired {
+        blurred_texture: TextureHandle,
+    },
+    Error {
+        message: String,
+    },
 }
 
-/// 剪贴板操作任务，由 gRPC 接收协程入队，由串行处理器逐个执行以避免乱序。
 struct ClipboardJob {
     content: String,
     auto_paste: bool,
@@ -49,27 +43,24 @@ struct ClipboardJob {
     notice_content: String,
 }
 
-/// egui 主应用，持有配置、状态机和跨线程通信通道。
 pub struct App {
     config: ClientConfig,
     state: AppState,
     connecting_target: Option<String>,
     last_connect_status: Option<String>,
+    last_qr_image: Option<ColorImage>,
     tray: Option<tray::Tray>,
     allow_close: bool,
     startup_visibility_pending: bool,
-    /// 接收来自 gRPC 线程的事件。
-    grpc_rx: mpsc::Receiver<ClientEvent>,
-    /// 接收来自托盘线程的用户操作事件。
+    /// gRPC 事件接收端；gRPC 线程退出后置为 `None`。
+    grpc_rx: Option<mpsc::Receiver<ClientEvent>>,
     tray_rx: mpsc::Receiver<tray::TrayEvent>,
     clipboard_job_tx: mpsc::Sender<ClipboardJob>,
     clipboard_notice_rx: mpsc::Receiver<String>,
-    /// 粘贴成功通知：`(显示文本, 显示开始时刻)`，过期后置为 `None`。
     paste_notice: Option<(String, Instant)>,
 }
 
 impl App {
-    /// 创建应用实例，同时启动 gRPC 客户端线程并初始化系统托盘。
     pub fn new(cc: &eframe::CreationContext<'_>, config: ClientConfig) -> Self {
         egui_cjk_font::load_cjk_font(&cc.egui_ctx);
 
@@ -78,8 +69,6 @@ impl App {
             config.server_host.clone(),
             config.grpc_port,
             config.grpc_auth_token.clone(),
-            config.reconnect_interval_secs,
-            config.max_reconnect_attempts,
             grpc_tx,
             cc.egui_ctx.clone(),
         );
@@ -107,19 +96,35 @@ impl App {
             state: AppState::Connecting,
             connecting_target: None,
             last_connect_status: None,
+            last_qr_image: None,
             tray,
             allow_close: false,
-            grpc_rx,
+            grpc_rx: Some(grpc_rx),
             tray_rx,
             clipboard_job_tx,
             paste_notice: None,
             clipboard_notice_rx,
         }
     }
+
+    fn start_grpc(&mut self, ctx: &Context) {
+        let (grpc_tx, grpc_rx) = mpsc::channel();
+        grpc::start(
+            self.config.server_host.clone(),
+            self.config.grpc_port,
+            self.config.grpc_auth_token.clone(),
+            grpc_tx,
+            ctx.clone(),
+        );
+        self.grpc_rx = Some(grpc_rx);
+        self.state = AppState::Connecting;
+        self.connecting_target = None;
+        self.last_connect_status = None;
+        self.last_qr_image = None;
+    }
 }
 
 impl eframe::App for App {
-    /// 非 UI 逻辑帧：处理事件、驱动状态机、管理窗口可见性。
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         if self.startup_visibility_pending {
             self.startup_visibility_pending = false;
@@ -135,61 +140,93 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
 
-        while let Ok(event) = self.grpc_rx.try_recv() {
-            match event {
-                ClientEvent::ConnectingTarget { message } => {
-                    self.state = AppState::Connecting;
-                    self.connecting_target = Some(message);
-                }
-                ClientEvent::ConnectingStatus { message } => {
-                    self.state = AppState::Connecting;
-                    self.last_connect_status = Some(message);
-                }
-                ClientEvent::SessionToken { url, .. } => {
-                    self.connecting_target = None;
-                    self.last_connect_status = None;
-                    let texture = generate_qr_texture(ctx, &url);
-                    self.state = AppState::WaitingScan {
-                        qr_texture: texture,
-                        url,
-                    };
-                }
-                ClientEvent::MobileConnected { device_info } => {
-                    self.connecting_target = None;
-                    self.last_connect_status = None;
-                    self.state = AppState::Connected { device_info };
-                    // 仅在托盘可用时才隐藏主窗口，避免托盘初始化失败后用户失去恢复入口。
-                    if self.tray.is_some() {
-                        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        if let Some(rx) = &self.grpc_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => match event {
+                        ClientEvent::ConnectingTarget { message } => {
+                            self.state = AppState::Connecting;
+                            self.connecting_target = Some(message);
+                        }
+                        ClientEvent::ConnectingStatus { message } => {
+                            self.state = AppState::Connecting;
+                            self.last_connect_status = Some(message);
+                        }
+                        ClientEvent::SessionToken { url, .. } => {
+                            self.connecting_target = None;
+                            self.last_connect_status = None;
+                            let (texture, color_image) = generate_qr_texture(ctx, &url);
+                            self.last_qr_image = Some(color_image);
+                            self.state = AppState::WaitingScan {
+                                qr_texture: texture,
+                                url,
+                            };
+                        }
+                        ClientEvent::MobileConnected { device_info } => {
+                            self.connecting_target = None;
+                            self.last_connect_status = None;
+                            self.last_qr_image = None;
+                            self.state = AppState::Connected { device_info };
+                            if self.tray.is_some() {
+                                ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+                            }
+                        }
+                        ClientEvent::MobileDisconnected => {
+                            self.connecting_target = None;
+                            self.last_connect_status = None;
+                            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                        }
+                        ClientEvent::ClipboardText { content } => {
+                            if content.is_empty() {
+                                continue;
+                            }
+                            let notice_content = if content.chars().count() > 20 {
+                                format!("{}...", content.chars().take(20).collect::<String>())
+                            } else {
+                                content.clone()
+                            };
+                            let _ = self.clipboard_job_tx.send(ClipboardJob {
+                                content,
+                                auto_paste: self.config.auto_paste,
+                                enter_after_paste: self.config.enter_after_paste,
+                                paste_delay_ms: self.config.paste_delay_ms,
+                                notice_content,
+                            });
+                        }
+                        ClientEvent::Error { message } => {
+                            self.connecting_target = None;
+                            self.last_connect_status = None;
+                            self.last_qr_image = None;
+                            self.state = AppState::Error { message };
+                        }
+                    },
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        self.grpc_rx = None;
+                        let waiting_scan =
+                            matches!(self.state, AppState::WaitingScan { .. });
+                        if waiting_scan {
+                            if let Some(qr_image) = self.last_qr_image.take() {
+                                let blurred = blur_color_image(qr_image);
+                                let blurred_texture = ctx.load_texture(
+                                    "qr_code_blurred",
+                                    blurred,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                self.state = AppState::Expired { blurred_texture };
+                                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                            } else {
+                                self.state = AppState::Connecting;
+                                self.last_connect_status =
+                                    Some("连接已断开，请点击刷新重试。".to_string());
+                            }
+                        } else if !matches!(self.state, AppState::Error { .. }) {
+                            self.state = AppState::Connecting;
+                            self.last_connect_status =
+                                Some("连接已断开，请点击刷新重试。".to_string());
+                        }
+                        break;
                     }
-                }
-                ClientEvent::MobileDisconnected => {
-                    self.connecting_target = None;
-                    self.state = AppState::Connecting;
-                    self.last_connect_status = Some("手机端已断开，等待新的二维码...".to_string());
-                    ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                }
-                ClientEvent::ClipboardText { content } => {
-                    if content.is_empty() {
-                        continue;
-                    }
-                    let notice_content = if content.chars().count() > 20 {
-                        format!("{}...", content.chars().take(20).collect::<String>())
-                    } else {
-                        content.clone()
-                    };
-                    let _ = self.clipboard_job_tx.send(ClipboardJob {
-                        content,
-                        auto_paste: self.config.auto_paste,
-                        enter_after_paste: self.config.enter_after_paste,
-                        paste_delay_ms: self.config.paste_delay_ms,
-                        notice_content,
-                    });
-                }
-                ClientEvent::Error { message } => {
-                    self.connecting_target = None;
-                    self.last_connect_status = None;
-                    self.state = AppState::Error { message };
                 }
             }
         }
@@ -213,7 +250,6 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_secs(self.config.notification_duration_secs));
         }
 
-        // 清除已过期的粘贴通知
         if let Some((_, t)) = &self.paste_notice
             && t.elapsed().as_secs() >= self.config.notification_duration_secs
         {
@@ -221,8 +257,9 @@ impl eframe::App for App {
         }
     }
 
-    /// UI 渲染帧：根据当前状态机绘制对应界面。
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let mut reconnect = false;
+
         ui.vertical_centered(|ui| {
             ui.add_space(20.0);
 
@@ -258,11 +295,41 @@ impl eframe::App for App {
                         ui.label("等待文本...");
                     }
                 }
+                AppState::Expired { blurred_texture } => {
+                    let (rect, response) =
+                        ui.allocate_exact_size(vec2(256.0, 256.0), Sense::click());
+
+                    let painter = ui.painter();
+
+                    painter.image(
+                        blurred_texture.id(),
+                        rect,
+                        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+
+                    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(120));
+                    painter.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "已过期\n\n点击刷新二维码",
+                        FontId::proportional(18.0),
+                        Color32::WHITE,
+                    );
+
+                    if response.clicked() {
+                        reconnect = true;
+                    }
+                }
                 AppState::Error { message } => {
                     ui.colored_label(egui::Color32::RED, format!("错误：{message}"));
                 }
             }
         });
+
+        if reconnect {
+            self.start_grpc(ui.ctx());
+        }
     }
 }
 
@@ -304,13 +371,7 @@ fn start_clipboard_worker(
     });
 }
 
-/// 将 URL 编码为二维码并生成 egui 纹理。
-///
-/// 使用 `qrcode` crate 生成灰度图像，最小尺寸 256×256，
-/// 再转换为 egui `ColorImage`（灰度像素）并上传至 GPU 纹理缓存。
-///
-/// 若二维码生成失败（URL 过长等），退回为占位图纹理并记录告警。
-fn generate_qr_texture(ctx: &Context, url: &str) -> TextureHandle {
+fn generate_qr_texture(ctx: &Context, url: &str) -> (TextureHandle, ColorImage) {
     use qrcode::QrCode;
 
     let code = match QrCode::new(url.as_bytes()) {
@@ -326,22 +387,22 @@ fn generate_qr_texture(ctx: &Context, url: &str) -> TextureHandle {
         .build();
     let (w, h) = (image.width() as usize, image.height() as usize);
 
-    let mut rgba_pixels: Vec<egui::Color32> = Vec::with_capacity(w * h);
-    for pixel in image.pixels() {
-        let v = pixel.0[0];
-        rgba_pixels.push(egui::Color32::from_gray(v));
-    }
+    let pixels: Vec<egui::Color32> = image
+        .pixels()
+        .map(|p| egui::Color32::from_gray(p.0[0]))
+        .collect();
 
     let color_image = ColorImage {
         size: [w, h],
-        pixels: rgba_pixels,
+        pixels,
         source_size: egui::vec2(w as f32, h as f32),
     };
 
-    ctx.load_texture("qr_code", color_image, egui::TextureOptions::LINEAR)
+    let texture = ctx.load_texture("qr_code", color_image.clone(), egui::TextureOptions::LINEAR);
+    (texture, color_image)
 }
 
-fn placeholder_qr_texture(ctx: &Context) -> TextureHandle {
+fn placeholder_qr_texture(ctx: &Context) -> (TextureHandle, ColorImage) {
     let size = 256usize;
     let mut pixels = Vec::with_capacity(size * size);
 
@@ -362,9 +423,28 @@ fn placeholder_qr_texture(ctx: &Context) -> TextureHandle {
         source_size: egui::vec2(size as f32, size as f32),
     };
 
-    ctx.load_texture(
+    let texture = ctx.load_texture(
         "qr_code_placeholder",
-        color_image,
+        color_image.clone(),
         egui::TextureOptions::LINEAR,
-    )
+    );
+    (texture, color_image)
+}
+
+fn blur_color_image(src: ColorImage) -> ColorImage {
+    let [w, h] = src.size;
+    let luma_buf: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
+        image::ImageBuffer::from_fn(w as u32, h as u32, |x, y| {
+            image::Luma([src.pixels[y as usize * w + x as usize].r()])
+        });
+    let blurred = image::imageops::blur(&luma_buf, 4.0);
+    let pixels: Vec<egui::Color32> = blurred
+        .pixels()
+        .map(|p| egui::Color32::from_gray(p.0[0]))
+        .collect();
+    ColorImage {
+        size: [w, h],
+        pixels,
+        source_size: egui::vec2(w as f32, h as f32),
+    }
 }

@@ -23,12 +23,6 @@ enter_after_paste = false
 # 自动粘贴前的延迟毫秒数（等待剪贴板写入完成），默认 150
 paste_delay_ms = 150
 
-# gRPC 断连后重连间隔（秒），默认 5
-reconnect_interval_secs = 5
-
-# 最大重连次数，0 表示无限重试，默认 0
-max_reconnect_attempts = 0
-
 # 启动时是否最小化到托盘，默认 false
 start_minimized = false
 

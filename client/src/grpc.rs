@@ -30,7 +30,7 @@ const FIRST_EVENT_TIMEOUT_SECS: u64 = 10;
 pub enum ClientEvent {
     /// 本轮连接尝试的目标地址（格式为「正在连接 <address> ...」）。
     ConnectingTarget { message: String },
-    /// 当前连接/重连的阶段性进度描述。
+    /// 当前连接阶段性进度描述。
     ConnectingStatus { message: String },
     /// 服务端分配了新的会话令牌和对应的手机扫码 URL。
     SessionToken {
@@ -44,23 +44,20 @@ pub enum ClientEvent {
     MobileDisconnected,
     /// 手机端发送了剪贴板文本内容。
     ClipboardText { content: String },
-    /// gRPC 连接发生不可恢复的错误（达到最大重连次数）。
+    /// gRPC 连接发生不可恢复的错误。
     Error { message: String },
 }
 
-/// 在独立线程中启动 gRPC 客户端，并将接收到的事件发送至 `tx`。
+/// 在独立线程中启动 gRPC 客户端，进行单次连接尝试，将接收到的事件发送至 `tx`。
 ///
-/// 内部使用独立的 tokio 多线程 runtime 运行异步 gRPC 客户端。
-/// 连接断开后按 `reconnect_interval_secs` 等待后自动重连，
-/// 直到达到 `max_reconnect_attempts`（0 表示无限重试）。
+/// 内部使用独立的 tokio 单线程 runtime 运行异步 gRPC 客户端。
+/// 连接关闭或出错后函数返回，`tx` 随之丢弃；UI 通过检测通道断开来感知连接结束。
 ///
 /// 当 `tx` 的接收端已关闭（UI 退出）时，函数立即返回。
 pub fn start(
     host: String,
     port: u16,
     auth_token: String,
-    reconnect_interval_secs: u64,
-    max_reconnect_attempts: u32,
     tx: mpsc::Sender<ClientEvent>,
     repaint_ctx: Context,
 ) {
@@ -92,241 +89,149 @@ pub fn start(
         };
 
         rt.block_on(async move {
-            let mut attempts: u32 = 0;
+            let connecting_message = format!("正在连接 {} ...", endpoint_config.endpoint);
+            if !send_event(
+                &tx,
+                &repaint_ctx,
+                ClientEvent::ConnectingTarget {
+                    message: connecting_message.clone(),
+                },
+            ) {
+                return;
+            }
+            info!("{connecting_message}");
 
-            loop {
-                let connecting_message = format!("正在连接 {} ...", endpoint_config.endpoint);
-                if !send_event(
-                    &tx,
-                    &repaint_ctx,
-                    ClientEvent::ConnectingTarget {
-                        message: connecting_message.clone(),
-                    },
-                ) {
+            let mut client = match connect_client(&endpoint_config, &tx, &repaint_ctx).await {
+                Err(e) => {
+                    let message = format!("连接服务端失败：{e}");
+                    warn!("{message}");
+                    let _ = send_event(
+                        &tx,
+                        &repaint_ctx,
+                        ClientEvent::ConnectingStatus {
+                            message: message.clone(),
+                        },
+                    );
                     return;
                 }
-                info!("{connecting_message}");
+                Ok(client) => client,
+            };
 
-                let last_failure_message =
-                    match connect_client(&endpoint_config, &tx, &repaint_ctx).await {
-                    Err(e) => {
-                        let message = format!(
-                            "连接服务端失败：{e}；将在 {reconnect_interval_secs} 秒后重试。"
-                        );
-                        warn!("{message}");
-                        if !send_event(
-                            &tx,
-                            &repaint_ctx,
-                            ClientEvent::ConnectingStatus {
-                                message: message.clone(),
-                            },
-                        ) {
-                            return;
-                        }
-                        message
-                    }
-                    Ok(mut client) => {
+            match tokio::time::timeout(
+                Duration::from_secs(SUBSCRIBE_TIMEOUT_SECS),
+                client.subscribe(SubscribeRequest {
+                    auth_token: auth_token.clone(),
+                }),
+            )
+            .await
+            {
+                Err(_) => {
+                    let message =
+                        format!("订阅 gRPC 流超时（>{SUBSCRIBE_TIMEOUT_SECS} 秒）。");
+                    warn!("{message}");
+                    let _ = send_event(
+                        &tx,
+                        &repaint_ctx,
+                        ClientEvent::ConnectingStatus { message },
+                    );
+                }
+                Ok(Err(e)) if e.code() == Code::Unauthenticated => {
+                    let _ = send_event(
+                        &tx,
+                        &repaint_ctx,
+                        ClientEvent::Error {
+                            message: "gRPC 鉴权失败，请检查 client.toml 中的 grpc_auth_token"
+                                .to_string(),
+                        },
+                    );
+                }
+                Ok(Err(e)) => {
+                    let message = format!("订阅 gRPC 流失败：{e}");
+                    warn!("{message}");
+                    let _ = send_event(
+                        &tx,
+                        &repaint_ctx,
+                        ClientEvent::ConnectingStatus { message },
+                    );
+                }
+                Ok(Ok(response)) => {
+                    let mut stream = response.into_inner();
+                    let first_event_result = loop {
                         match tokio::time::timeout(
-                            Duration::from_secs(SUBSCRIBE_TIMEOUT_SECS),
-                            client.subscribe(SubscribeRequest {
-                                auth_token: auth_token.clone(),
-                            }),
+                            Duration::from_secs(FIRST_EVENT_TIMEOUT_SECS),
+                            stream.message(),
                         )
                         .await
                         {
                             Err(_) => {
                                 let message = format!(
-                                    "订阅 gRPC 流超时（>{SUBSCRIBE_TIMEOUT_SECS} 秒）；将在 {reconnect_interval_secs} 秒后重试。"
+                                    "等待服务端首条 gRPC 事件超时（>{FIRST_EVENT_TIMEOUT_SECS} 秒）。"
                                 );
                                 warn!("{message}");
-                                if !send_event(
-                                    &tx,
-                                    &repaint_ctx,
-                                    ClientEvent::ConnectingStatus {
-                                        message: message.clone(),
-                                    },
-                                ) {
-                                    return;
-                                }
-                                message
-                            }
-                            Ok(Err(e)) if e.code() == Code::Unauthenticated => {
                                 let _ = send_event(
                                     &tx,
                                     &repaint_ctx,
-                                    ClientEvent::Error {
-                                        message:
-                                            "gRPC 鉴权失败，请检查 client.toml 中的 grpc_auth_token"
-                                                .to_string(),
-                                    },
+                                    ClientEvent::ConnectingStatus { message: message.clone() },
                                 );
-                                return;
+                                break Err(());
                             }
                             Ok(Err(e)) => {
-                                let message =
-                                    format!("订阅 gRPC 流失败：{e}；将在 {reconnect_interval_secs} 秒后重试。");
+                                let message = format!("gRPC 数据流中断：{e}");
                                 warn!("{message}");
-                                if !send_event(
+                                let _ = send_event(
                                     &tx,
                                     &repaint_ctx,
-                                    ClientEvent::ConnectingStatus {
-                                        message: message.clone(),
-                                    },
-                                ) {
-                                    return;
-                                }
-                                message
+                                    ClientEvent::ConnectingStatus { message },
+                                );
+                                break Err(());
                             }
-                            Ok(Ok(response)) => {
-                                attempts = 0;
-                                let mut stream = response.into_inner();
-                                let first_event_result = loop {
-                                    match tokio::time::timeout(
-                                        Duration::from_secs(FIRST_EVENT_TIMEOUT_SECS),
-                                        stream.message(),
-                                    )
-                                    .await
-                                    {
-                                        Err(_) => {
-                                            let message = format!(
-                                                "等待服务端首条 gRPC 事件超时（>{FIRST_EVENT_TIMEOUT_SECS} 秒）；将在 {reconnect_interval_secs} 秒后重试。"
-                                            );
-                                            warn!("{message}");
-                                            if !send_event(
-                                                &tx,
-                                                &repaint_ctx,
-                                                ClientEvent::ConnectingStatus {
-                                                    message: message.clone(),
-                                                },
-                                            ) {
-                                                return;
-                                            }
-                                            break Err(message);
-                                        }
-                                        Ok(Err(e)) => {
-                                            let message =
-                                                format!("gRPC 数据流中断：{e}；正在重新连接。");
-                                            warn!("{message}");
-                                            if !send_event(
-                                                &tx,
-                                                &repaint_ctx,
-                                                ClientEvent::ConnectingStatus {
-                                                    message: message.clone(),
-                                                },
-                                            ) {
-                                                return;
-                                            }
-                                            break Err(message);
-                                        }
-                                        Ok(Ok(None)) => {
-                                            let message = "gRPC 连接已关闭，正在重新连接。".to_string();
-                                            info!("{message}");
-                                            if !send_event(
-                                                &tx,
-                                                &repaint_ctx,
-                                                ClientEvent::ConnectingStatus {
-                                                    message: message.clone(),
-                                                },
-                                            ) {
-                                                return;
-                                            }
-                                            break Err(message);
-                                        }
-                                        Ok(Ok(Some(ServerEvent { event: Some(ev) }))) => {
-                                            if let Some(client_event) = map_server_event(ev) {
-                                                break Ok(client_event);
-                                            }
-
-                                            let message = format!(
-                                                "服务端连接已建立，正在等待首条业务事件；将在 {reconnect_interval_secs} 秒后继续观察。"
-                                            );
-                                            if !send_event(
-                                                &tx,
-                                                &repaint_ctx,
-                                                ClientEvent::ConnectingStatus { message },
-                                            ) {
-                                                return;
-                                            }
-                                        }
-                                        Ok(Ok(Some(ServerEvent { event: None }))) => {}
-                                    }
-                                };
-
-                                match first_event_result {
-                                    Ok(first_event) => {
-                                        if !send_event(&tx, &repaint_ctx, first_event) {
-                                            return;
-                                        }
-
-                                        loop {
-                                            match stream.message().await {
-                                                Err(e) => {
-                                                    let message =
-                                                        format!("gRPC 数据流中断：{e}；正在重新连接。");
-                                                    warn!("{message}");
-                                                    if !send_event(
-                                                        &tx,
-                                                        &repaint_ctx,
-                                                        ClientEvent::ConnectingStatus {
-                                                            message: message.clone(),
-                                                        },
-                                                    ) {
-                                                        return;
-                                                    }
-                                                    break message;
-                                                }
-                                                Ok(None) => {
-                                                    let message =
-                                                        "gRPC 连接已关闭，正在重新连接。".to_string();
-                                                    info!("{message}");
-                                                    if !send_event(
-                                                        &tx,
-                                                        &repaint_ctx,
-                                                        ClientEvent::ConnectingStatus {
-                                                            message: message.clone(),
-                                                        },
-                                                    ) {
-                                                        return;
-                                                    }
-                                                    break message;
-                                                }
-                                                Ok(Some(ServerEvent { event: Some(ev) })) => {
-                                                    let Some(client_event) = map_server_event(ev)
-                                                    else {
-                                                        continue;
-                                                    };
-                                                    if !send_event(&tx, &repaint_ctx, client_event) {
-                                                        // UI 线程已退出，终止 gRPC 循环
-                                                        return;
-                                                    }
-                                                }
-                                                Ok(Some(ServerEvent { event: None })) => {}
-                                            }
-                                        }
-                                    }
-                                    Err(message) => message,
+                            Ok(Ok(None)) => {
+                                info!("gRPC 连接已关闭。");
+                                break Err(());
+                            }
+                            Ok(Ok(Some(ServerEvent { event: Some(ev) }))) => {
+                                if let Some(client_event) = map_server_event(ev) {
+                                    break Ok(client_event);
                                 }
+                            }
+                            Ok(Ok(Some(ServerEvent { event: None }))) => {}
+                        }
+                    };
+
+                    if let Ok(first_event) = first_event_result {
+                        if !send_event(&tx, &repaint_ctx, first_event) {
+                            return;
+                        }
+
+                        loop {
+                            match stream.message().await {
+                                Err(e) => {
+                                    let message = format!("gRPC 数据流中断：{e}");
+                                    warn!("{message}");
+                                    let _ = send_event(
+                                        &tx,
+                                        &repaint_ctx,
+                                        ClientEvent::ConnectingStatus { message },
+                                    );
+                                    break;
+                                }
+                                Ok(None) => {
+                                    info!("gRPC 连接已关闭。");
+                                    break;
+                                }
+                                Ok(Some(ServerEvent { event: Some(ev) })) => {
+                                    let Some(client_event) = map_server_event(ev) else {
+                                        continue;
+                                    };
+                                    if !send_event(&tx, &repaint_ctx, client_event) {
+                                        return;
+                                    }
+                                }
+                                Ok(Some(ServerEvent { event: None })) => {}
                             }
                         }
                     }
-                };
-
-                attempts += 1;
-                if max_reconnect_attempts > 0 && attempts >= max_reconnect_attempts {
-                    let message = format!(
-                        "连接服务端失败，已重试 {max_reconnect_attempts} 次。最近一次错误：{last_failure_message}"
-                    );
-                    let _ = send_event(
-                        &tx,
-                        &repaint_ctx,
-                        ClientEvent::Error {
-                            message,
-                        },
-                    );
-                    return;
                 }
-
-                tokio::time::sleep(Duration::from_secs(reconnect_interval_secs)).await;
             }
         });
     });
