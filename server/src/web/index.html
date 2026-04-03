@@ -3,201 +3,401 @@
 <!doctype html>
 <html lang="zh-CN">
   <head>
-    <meta charset="UTF-8" />
+    <meta charset="UTF-8">
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"
-    />
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    >
     <title>发送文字到 PC</title>
-    <style>
-      *,
-      *::before,
-      *::after {
-        box-sizing: border-box;
-        margin: 0;
-        padding: 0;
-      }
+    <style nonce="__NONCE__">
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #f5f5f5;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      padding: env(safe-area-inset-top, 0) env(safe-area-inset-right, 0) 0
+        env(safe-area-inset-left, 0);
+    }
+    @supports (height: 100dvh) {
       body {
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        background: #f5f5f5;
-        min-height: 100vh;
-        display: flex;
-        flex-direction: column;
-        padding: 16px;
+        height: 100dvh;
       }
-      #status {
-        padding: 10px 14px;
-        border-radius: 8px;
-        font-size: 14px;
-        font-weight: 500;
-        margin-bottom: 16px;
-        text-align: center;
-      }
-      .status-connecting {
-        background: #fff3cd;
-        color: #856404;
-      }
-      .status-connected {
-        background: #d1e7dd;
-        color: #0a3622;
-      }
-      .status-error {
-        background: #f8d7da;
-        color: #58151c;
-      }
-      textarea {
-        width: 100%;
-        flex: 1;
-        min-height: 180px;
-        padding: 12px;
-        font-size: 16px;
-        border: 1.5px solid #ccc;
-        border-radius: 8px;
-        resize: vertical;
-        outline: none;
-        background: #fff;
-        transition: border-color 0.2s;
-      }
-      textarea:focus {
-        border-color: #0d6efd;
-      }
-      #send-btn {
-        display: block;
-        width: 100%;
-        margin-top: 12px;
-        padding: 14px;
-        font-size: 17px;
-        font-weight: 600;
-        color: #fff;
-        background: #0d6efd;
-        border: none;
-        border-radius: 8px;
-        cursor: pointer;
-        min-height: 44px;
-        transition:
-          background 0.2s,
-          opacity 0.2s;
-      }
-      #send-btn:disabled {
-        background: #adb5bd;
-        cursor: not-allowed;
-      }
-      #send-btn:not(:disabled):active {
-        background: #0a58ca;
-      }
-      #toast {
-        position: fixed;
-        bottom: 24px;
-        left: 50%;
-        transform: translateX(-50%);
-        background: rgba(0, 0, 0, 0.75);
-        color: #fff;
-        padding: 8px 20px;
-        border-radius: 20px;
-        font-size: 14px;
-        opacity: 0;
-        pointer-events: none;
-        transition: opacity 0.3s;
-      }
-      #toast.show {
-        opacity: 1;
-      }
+    }
+    .container {
+      max-width: 480px;
+      width: 100%;
+      margin: 0 auto;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      padding: 16px 16px 0;
+    }
+    #status {
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 500;
+      margin-bottom: 16px;
+      text-align: center;
+    }
+    .status-connecting {
+      background: #fff3cd;
+      color: #856404;
+    }
+    .status-connected {
+      background: #d1e7dd;
+      color: #0a3622;
+    }
+    .status-error {
+      background: #f8d7da;
+      color: #58151c;
+    }
+    .input-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    textarea {
+      flex: 1;
+      width: 100%;
+      min-height: 0;
+      padding: 12px;
+      font-size: 16px;
+      border: 1.5px solid #ccc;
+      border-radius: 8px;
+      resize: none;
+      outline: none;
+      background: #fff;
+    }
+    .action-area {
+      flex-shrink: 0;
+      padding-top: 12px;
+      padding-bottom: max(env(safe-area-inset-bottom, 0px), 8px);
+    }
+    button {
+      display: block;
+      width: 100%;
+      padding: 12px 0;
+      font-size: 17px;
+      font-weight: 600;
+      color: #fff;
+      background: #0d6efd;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      min-height: 44px;
+    }
+    button:disabled {
+      background: #adb5bd;
+      cursor: not-allowed;
+    }
     </style>
   </head>
   <body>
-    <div id="status" class="status-connecting">连接中...</div>
-    <textarea
-      id="input"
-      placeholder="输入要发送到 PC 的文本..."
-      disabled
-    ></textarea>
-    <button id="send-btn" disabled>发送</button>
-    <div id="toast"></div>
+    <div class="container">
+      <div id="status" class="status-connecting">连接中...</div>
+      <div class="input-area">
+        <textarea id="input" placeholder="输入要发送到 PC 的文本..." disabled></textarea>
+      </div>
+      <div class="action-area"><button id="send-btn" type="button" disabled>发送</button></div>
+    </div>
 
-    <script>
-      const statusEl = document.getElementById("status");
-      const inputEl = document.getElementById("input");
-      const sendBtn = document.getElementById("send-btn");
-      const toastEl = document.getElementById("toast");
+    <script nonce="__NONCE__">
+    const pairingId = "__PAIRING_ID__"
+    const statusEl = document.getElementById("status")
+    const inputEl = document.getElementById("input")
+    const sendBtn = document.getElementById("send-btn")
+    const wsProto = location.protocol === "https:" ? "wss" : "ws"
 
-      let toastTimer = null;
-      function showToast(msg) {
-        toastEl.textContent = msg;
-        toastEl.classList.add("show");
-        clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2000);
+    const initialHash = window.location.hash
+    const pairingSecret = (() => {
+      const fragment = initialHash.startsWith("#ps=")
+        ? decodeURIComponent(initialHash.slice(4))
+        : ""
+      history.replaceState(null, "", `/m/${pairingId}`)
+      return fragment
+    })()
+
+    let ws = null
+    let heartbeatTimer = null
+
+    let reconnectState = "idle"
+    let retryCount = 0
+    let totalElapsedMs = 0
+    let reconnectDelay = 1000
+    let actionMode = "send"
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text
+      statusEl.className = `status-${cls}`
+    }
+
+    function updateSendButton() {
+      if (actionMode === "reconnect") {
+        sendBtn.textContent = "重新连接"
+        sendBtn.disabled = reconnectState !== "stopped"
+        return
       }
+      sendBtn.textContent = "发送"
+      sendBtn.disabled = inputEl.disabled || inputEl.value.trim() === ""
+    }
 
-      function setStatus(text, cls) {
-        statusEl.textContent = text;
-        statusEl.className = "status-" + cls;
+    function enableInput(enabled) {
+      inputEl.disabled = !enabled
+      updateSendButton()
+    }
+
+    function setActionMode(mode) {
+      actionMode = mode
+      updateSendButton()
+    }
+
+    function clearHeartbeat() {
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer)
+        heartbeatTimer = null
       }
+    }
 
-      function updateSendButton() {
-        sendBtn.disabled = inputEl.disabled || inputEl.value.trim() === "";
+    async function api(path, body) {
+      const response = await fetch(path, {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : "{}",
+      })
+      let data = {}
+      try {
+        data = await response.json()
+      } catch (_error) {}
+      return { response, data }
+    }
+
+    function clearStoredPairingId() {
+      if (localStorage.getItem("qr_paste_pairing_id") === pairingId) {
+        localStorage.removeItem("qr_paste_pairing_id")
       }
+    }
 
-      function setInputEnabled(ok) {
-        inputEl.disabled = !ok;
-        updateSendButton();
+    function stopWithError(message, options = {}) {
+      const { clearStoredPairing = false, allowReconnect = false } = options
+      if (clearStoredPairing) {
+        clearStoredPairingId()
       }
+      reconnectState = "stopped"
+      clearHeartbeat()
+      ws = null
+      enableInput(false)
+      setActionMode(allowReconnect ? "reconnect" : "send")
+      setStatus(message, "error")
+    }
 
-      const token = location.pathname.split("/").pop();
-      const wsProto = location.protocol === "https:" ? "wss" : "ws";
-      const wsUrl = `${wsProto}://${location.host}/ws/mobile/${token}`;
+    function resetReconnectBudget() {
+      retryCount = 0
+      totalElapsedMs = 0
+      reconnectDelay = 1000
+    }
 
-      let ws = new WebSocket(wsUrl);
-      let disconnectedByClient = false;
+    function startReconnect() {
+      if (reconnectState !== "idle" && reconnectState !== "connected") {
+        return
+      }
+      if (!localStorage.getItem("qr_paste_pairing_id")) {
+        stopWithError("无配对信息，请重新扫码", { clearStoredPairing: true })
+        return
+      }
+      if (retryCount >= 10 || totalElapsedMs >= 600000) {
+        stopWithError("重连次数已耗尽，请重新扫码")
+        return
+      }
+      reconnectState = "checking_status"
+      doCheckStatus()
+    }
 
+    async function doCheckStatus() {
+      try {
+        const { response, data } = await api(`/api/pairing/${pairingId}/status`)
+        if (response.status === 401) {
+          stopWithError("登录已过期，请重新扫码", { clearStoredPairing: true })
+          return
+        }
+        if (response.status === 404) {
+          stopWithError("配对记录不存在，请重新扫码", { clearStoredPairing: true })
+          return
+        }
+        if (response.ok && data.online) {
+          reconnectState = "requesting_ticket"
+          doRequestTicket()
+          return
+        }
+        setStatus("等待 PC 在线...", "connecting")
+        scheduleBackoff(() => {
+          reconnectState = "checking_status"
+          doCheckStatus()
+        })
+      } catch (_error) {
+        scheduleBackoff(() => {
+          reconnectState = "checking_status"
+          doCheckStatus()
+        })
+      }
+    }
+
+    async function doRequestTicket() {
+      try {
+        const { response, data } = await api(`/api/pairing/${pairingId}/ws-ticket`)
+        if (response.status === 401) {
+          stopWithError("凭据失效，请重新扫码", { clearStoredPairing: true })
+          return
+        }
+        if (response.status === 404) {
+          stopWithError("配对记录不存在，请重新扫码", { clearStoredPairing: true })
+          return
+        }
+        if (response.ok && data.ws_ticket) {
+          reconnectState = "connecting_ws"
+          doConnectWs(data.ws_ticket)
+          return
+        }
+        reconnectState = "backoff"
+        scheduleBackoff(() => {
+          reconnectState = "checking_status"
+          doCheckStatus()
+        })
+      } catch (_error) {
+        reconnectState = "backoff"
+        scheduleBackoff(() => {
+          reconnectState = "checking_status"
+          doCheckStatus()
+        })
+      }
+    }
+
+    function doConnectWs(ticket) {
+      ws = new WebSocket(`${wsProto}://${location.host}/ws/mobile/${pairingId}`, [
+        "qr-paste.v1",
+        `ticket.${ticket}`,
+      ])
       ws.addEventListener("open", () => {
-        setStatus("已连接到 PC", "connected");
-        setInputEnabled(true);
-      });
-
-      ws.addEventListener("message", (ev) => {
-        try {
-          const msg = JSON.parse(ev.data);
-          if (msg.type === "client_disconnected") {
-            disconnectedByClient = true;
-            setStatus("PC 客户端已断开，请重新扫码", "error");
-            setInputEnabled(true);
-            ws.close();
-          } else if (msg.type === "error") {
-            showToast(msg.message || "发送失败");
+        reconnectState = "connected"
+        resetReconnectBudget()
+        setActionMode("send")
+        setStatus("已连接到 PC", "connected")
+        enableInput(true)
+        heartbeatTimer = setInterval(() => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: "ping" }))
           }
-        } catch (error) {
-          console.warn("无法解析服务端消息", error);
-          setStatus("收到无法识别的服务端消息", "error");
+        }, 30000)
+      })
+      ws.addEventListener("message", (event) => {
+        try {
+          const message = JSON.parse(event.data)
+          if (message.type === "client_disconnected") {
+            setStatus("PC 客户端已断开", "error")
+            enableInput(false)
+          } else if (message.type === "pong") {
+            console.log("[qr-paste] pong received")
+          }
+        } catch (_error) {}
+      })
+      ws.addEventListener("close", (event) => {
+        clearHeartbeat()
+        ws = null
+        if (event.code === 4001) {
+          stopWithError("已在其他设备上打开，可点下方按钮重新连接", { allowReconnect: true })
+        } else if (event.code === 4002) {
+          stopWithError("凭据已更新，请重新扫码", { clearStoredPairing: true })
+        } else {
+          reconnectState = "idle"
+          setActionMode("send")
+          enableInput(false)
+          startReconnect()
         }
-      });
+      })
+      ws.addEventListener("error", () => {})
+    }
 
-      ws.addEventListener("close", () => {
-        if (disconnectedByClient) return;
-        setStatus("连接已断开，请重新扫码", "error");
-        setInputEnabled(true);
-      });
+    function scheduleBackoff(callback) {
+      const baseDelay = reconnectDelay
+      const jitteredDelay = Math.round(baseDelay * (0.8 + Math.random() * 0.4))
+      reconnectDelay = Math.min(baseDelay * 2, 60000)
 
-      ws.addEventListener("error", () => {
-        setStatus("连接失败，请重新扫码", "error");
-        setInputEnabled(true);
-      });
-
-      inputEl.addEventListener("input", () => {
-        updateSendButton();
-      });
-
-      sendBtn.addEventListener("click", () => {
-        const content = inputEl.value.trim();
-        if (!content) return;
-        if (ws.readyState !== WebSocket.OPEN) {
-          showToast("发送失败：连接已断开");
-          return;
+      function startTimer() {
+        retryCount++
+        totalElapsedMs += baseDelay
+        if (retryCount >= 10 || totalElapsedMs >= 600000) {
+          stopWithError("重连次数已耗尽，请重新扫码")
+          return
         }
-        ws.send(JSON.stringify({ type: "clipboard_text", content }));
-        inputEl.value = "";
-        sendBtn.disabled = true;
-        showToast("已发送");
-      });
+        setStatus("重连中...", "connecting")
+        setTimeout(callback, jitteredDelay)
+      }
+
+      if (document.hidden) {
+        const onVisible = () => {
+          if (!document.hidden) {
+            document.removeEventListener("visibilitychange", onVisible)
+            startTimer()
+          }
+        }
+        document.addEventListener("visibilitychange", onVisible)
+      } else {
+        startTimer()
+      }
+    }
+
+    async function bootstrap() {
+      if (!pairingSecret) {
+        setStatus("缺少配对凭据，请重新扫码", "error")
+        return
+      }
+      const { response, data } = await api(`/api/pairing/${pairingId}/bootstrap`, {
+        pairing_secret: pairingSecret,
+      })
+      if (!response.ok) {
+        setStatus(response.status === 404 ? "二维码已失效，请重新扫码" : "初始化失败", "error")
+        return
+      }
+      localStorage.setItem("qr_paste_pairing_id", pairingId)
+      reconnectState = "idle"
+      if (data.online) {
+        reconnectState = "requesting_ticket"
+        doRequestTicket()
+      } else {
+        reconnectState = "checking_status"
+        doCheckStatus()
+      }
+    }
+
+    inputEl.addEventListener("input", updateSendButton)
+    sendBtn.addEventListener("click", () => {
+      if (actionMode === "reconnect") {
+        resetReconnectBudget()
+        reconnectState = "idle"
+        setActionMode("send")
+        startReconnect()
+        return
+      }
+      const content = inputEl.value.trim()
+      if (!content || !ws || ws.readyState !== WebSocket.OPEN) {
+        return
+      }
+      ws.send(JSON.stringify({ type: "clipboard_text", content }))
+      inputEl.value = ""
+      updateSendButton()
+    })
+
+    bootstrap()
     </script>
   </body>
 </html>
