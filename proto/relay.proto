@@ -5,10 +5,12 @@ package relay;
 
 service ClientRelay {
   rpc Subscribe(SubscribeRequest) returns (stream ServerEvent);
+  rpc Ping(PingRequest) returns (PingResponse);
 }
 
 message SubscribeRequest {
   string auth_token = 1;
+  string pairing_id = 2;
 }
 
 message ServerEvent {
@@ -19,6 +21,8 @@ message ServerEvent {
     ClipboardText clipboard_text = 4;
     Ping ping = 5;
   }
+  // 服务端在首帧 SessionToken 事件中附带的 gRPC 会话令牌，用于后续 Ping 鉴权。
+  string grpc_session_token = 6;
 }
 
 message SessionToken {
@@ -37,3 +41,9 @@ message ClipboardText {
 }
 
 message Ping {}
+
+message PingRequest {
+  string grpc_session_token = 1;
+}
+
+message PingResponse {}

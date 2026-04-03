@@ -7,16 +7,28 @@ use {
         grpc::{self, ClientEvent},
         tray,
     },
-    egui::{
-        Align2, Color32, ColorImage, Context, FontId, Rect, Sense, TextureHandle, ViewportCommand,
-        vec2,
-    },
+    egui::{Color32, Context, TextureHandle, ViewportCommand},
     std::{
-        sync::mpsc,
-        sync::mpsc::TryRecvError,
+        sync::{mpsc, mpsc::TryRecvError},
         time::{Duration, Instant},
     },
 };
+
+#[derive(Clone)]
+enum RevokeState {
+    Idle,
+    Running,
+    Success(Instant),
+    Error(String),
+}
+
+impl RevokeState {
+    const fn idle() -> Self { Self::Idle }
+}
+
+impl Default for RevokeState {
+    fn default() -> Self { Self::idle() }
+}
 
 enum AppState {
     Connecting,
@@ -27,9 +39,6 @@ enum AppState {
     Connected {
         device_info: String,
     },
-    Expired {
-        blurred_texture: TextureHandle,
-    },
     Error {
         message: String,
     },
@@ -38,7 +47,8 @@ enum AppState {
 struct ClipboardJob {
     content: String,
     auto_paste: bool,
-    enter_after_paste: bool,
+    emulation_key_after_paste: Option<String>,
+    delete_clipboard_after_paste: bool,
     paste_delay_ms: u64,
     notice_content: String,
 }
@@ -48,7 +58,6 @@ pub struct App {
     state: AppState,
     connecting_target: Option<String>,
     last_connect_status: Option<String>,
-    last_qr_image: Option<ColorImage>,
     tray: Option<tray::Tray>,
     allow_close: bool,
     startup_visibility_pending: bool,
@@ -58,6 +67,14 @@ pub struct App {
     clipboard_job_tx: mpsc::Sender<ClipboardJob>,
     clipboard_notice_rx: mpsc::Receiver<String>,
     paste_notice: Option<(String, Instant)>,
+    last_session_token: Option<String>,
+    last_grpc_session_token: Option<String>,
+    last_public_base_url: Option<String>,
+    revoke_state: RevokeState,
+    /// 当前重连退避间隔（指数增长，上限 reconnect_max_interval_secs）。
+    reconnect_delay: Duration,
+    /// 防止重复调度重连：`true` 表示已调度，下一帧执行 `start_grpc()`。
+    reconnect_pending: bool,
 }
 
 impl App {
@@ -66,9 +83,13 @@ impl App {
 
         let (grpc_tx, grpc_rx) = mpsc::channel();
         grpc::start(
-            config.server_host.clone(),
-            config.grpc_port,
-            config.grpc_auth_token.clone(),
+            grpc::StartOptions {
+                host: config.server_host.clone(),
+                port: config.grpc_port,
+                auth_token: config.grpc_auth_token.clone(),
+                pairing_id: config.pairing_id.clone(),
+                heartbeat_interval_secs: config.heartbeat_interval_secs,
+            },
             grpc_tx,
             cc.egui_ctx.clone(),
         );
@@ -96,7 +117,6 @@ impl App {
             state: AppState::Connecting,
             connecting_target: None,
             last_connect_status: None,
-            last_qr_image: None,
             tray,
             allow_close: false,
             grpc_rx: Some(grpc_rx),
@@ -104,15 +124,25 @@ impl App {
             clipboard_job_tx,
             paste_notice: None,
             clipboard_notice_rx,
+            last_session_token: None,
+            last_grpc_session_token: None,
+            last_public_base_url: None,
+            revoke_state: RevokeState::Idle,
+            reconnect_delay: Duration::from_secs(1),
+            reconnect_pending: false,
         }
     }
 
     fn start_grpc(&mut self, ctx: &Context) {
         let (grpc_tx, grpc_rx) = mpsc::channel();
         grpc::start(
-            self.config.server_host.clone(),
-            self.config.grpc_port,
-            self.config.grpc_auth_token.clone(),
+            grpc::StartOptions {
+                host: self.config.server_host.clone(),
+                port: self.config.grpc_port,
+                auth_token: self.config.grpc_auth_token.clone(),
+                pairing_id: self.config.pairing_id.clone(),
+                heartbeat_interval_secs: self.config.heartbeat_interval_secs,
+            },
             grpc_tx,
             ctx.clone(),
         );
@@ -120,12 +150,75 @@ impl App {
         self.state = AppState::Connecting;
         self.connecting_target = None;
         self.last_connect_status = None;
-        self.last_qr_image = None;
+        self.last_session_token = None;
+        self.last_grpc_session_token = None;
+        self.last_public_base_url = None;
+        self.revoke_state = RevokeState::Idle;
+    }
+
+    fn revoke_endpoint_url(&self) -> String {
+        let base = self
+            .last_public_base_url
+            .as_deref()
+            .unwrap_or(self.config.server_host.trim())
+            .trim_end_matches('/');
+        if base.starts_with("http://") || base.starts_with("https://") {
+            format!("{base}/api/pairing/{}/revoke", self.config.pairing_id)
+        } else {
+            format!(
+                "http://{base}/api/pairing/{}/revoke",
+                self.config.pairing_id
+            )
+        }
+    }
+
+    fn trigger_revoke(&mut self, ctx: &Context) {
+        let Some(grpc_session_token) = self.last_grpc_session_token.clone() else {
+            self.revoke_state =
+                RevokeState::Error("当前还没有可用会话，无法撤销访问。".to_string());
+            return;
+        };
+
+        let url = self.revoke_endpoint_url();
+        let repaint_ctx = ctx.clone();
+        self.revoke_state = RevokeState::Running;
+
+        std::thread::spawn(move || {
+            let result = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .and_then(|client| client.post(url).bearer_auth(grpc_session_token).send());
+
+            let next_state = match result {
+                Ok(response) if response.status().is_success() => {
+                    RevokeState::Success(Instant::now())
+                }
+                Ok(response) => RevokeState::Error(format!("撤销失败：HTTP {}", response.status())),
+                Err(err) => RevokeState::Error(format!("撤销失败：{err}")),
+            };
+
+            repaint_ctx.data_mut(|data| {
+                data.insert_temp(egui::Id::new("revoke_state"), next_state);
+            });
+            repaint_ctx.request_repaint();
+        });
     }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        if let Some(next_state) =
+            ctx.data_mut(|data| data.remove_temp::<RevokeState>(egui::Id::new("revoke_state")))
+        {
+            self.revoke_state = next_state;
+        }
+
+        // 重连调度：grpc_rx 已断开且 reconnect_pending，则启动新 gRPC 连接
+        if self.reconnect_pending && self.grpc_rx.is_none() {
+            self.reconnect_pending = false;
+            self.start_grpc(ctx);
+        }
+
         if self.startup_visibility_pending {
             self.startup_visibility_pending = false;
             ctx.send_viewport_cmd(ViewportCommand::Visible(self.tray.is_none()));
@@ -152,11 +245,17 @@ impl eframe::App for App {
                             self.state = AppState::Connecting;
                             self.last_connect_status = Some(message);
                         }
-                        ClientEvent::SessionToken { url, .. } => {
+                        ClientEvent::GrpcSessionToken { token } => {
+                            self.last_grpc_session_token = Some(token);
+                        }
+                        ClientEvent::SessionToken { token, url } => {
                             self.connecting_target = None;
                             self.last_connect_status = None;
-                            let (texture, color_image) = generate_qr_texture(ctx, &url);
-                            self.last_qr_image = Some(color_image);
+                            self.last_session_token = Some(token);
+                            self.last_public_base_url = public_base_url_from_session_url(&url);
+                            // 重连成功，重置退避间隔
+                            self.reconnect_delay = Duration::from_secs(1);
+                            let texture = generate_qr_texture(ctx, &url);
                             self.state = AppState::WaitingScan {
                                 qr_texture: texture,
                                 url,
@@ -165,7 +264,6 @@ impl eframe::App for App {
                         ClientEvent::MobileConnected { device_info } => {
                             self.connecting_target = None;
                             self.last_connect_status = None;
-                            self.last_qr_image = None;
                             self.state = AppState::Connected { device_info };
                             if self.tray.is_some() {
                                 ctx.send_viewport_cmd(ViewportCommand::Visible(false));
@@ -188,7 +286,13 @@ impl eframe::App for App {
                             let _ = self.clipboard_job_tx.send(ClipboardJob {
                                 content,
                                 auto_paste: self.config.auto_paste,
-                                enter_after_paste: self.config.enter_after_paste,
+                                emulation_key_after_paste: self
+                                    .config
+                                    .emulation_key_after_paste
+                                    .clone(),
+                                delete_clipboard_after_paste: self
+                                    .config
+                                    .delete_clipboard_after_paste,
                                 paste_delay_ms: self.config.paste_delay_ms,
                                 notice_content,
                             });
@@ -196,34 +300,20 @@ impl eframe::App for App {
                         ClientEvent::Error { message } => {
                             self.connecting_target = None;
                             self.last_connect_status = None;
-                            self.last_qr_image = None;
                             self.state = AppState::Error { message };
                         }
                     },
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         self.grpc_rx = None;
-                        let waiting_scan =
-                            matches!(self.state, AppState::WaitingScan { .. });
-                        if waiting_scan {
-                            if let Some(qr_image) = self.last_qr_image.take() {
-                                let blurred = blur_color_image(qr_image);
-                                let blurred_texture = ctx.load_texture(
-                                    "qr_code_blurred",
-                                    blurred,
-                                    egui::TextureOptions::LINEAR,
-                                );
-                                self.state = AppState::Expired { blurred_texture };
-                                ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-                            } else {
-                                self.state = AppState::Connecting;
-                                self.last_connect_status =
-                                    Some("连接已断开，请点击刷新重试。".to_string());
-                            }
-                        } else if !matches!(self.state, AppState::Error { .. }) {
+                        let should_reconnect = !matches!(self.state, AppState::Error { .. });
+                        if should_reconnect && !self.reconnect_pending {
+                            let max = Duration::from_secs(self.config.reconnect_max_interval_secs);
                             self.state = AppState::Connecting;
-                            self.last_connect_status =
-                                Some("连接已断开，请点击刷新重试。".to_string());
+                            self.last_connect_status = Some("连接断开，正在重试...".to_string());
+                            self.reconnect_pending = true;
+                            ctx.request_repaint_after(self.reconnect_delay);
+                            self.reconnect_delay = (self.reconnect_delay * 2).min(max);
                         }
                         break;
                     }
@@ -258,8 +348,6 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let mut reconnect = false;
-
         ui.vertical_centered(|ui| {
             ui.add_space(20.0);
 
@@ -294,31 +382,33 @@ impl eframe::App for App {
                     } else {
                         ui.label("等待文本...");
                     }
-                }
-                AppState::Expired { blurred_texture } => {
-                    let (rect, response) =
-                        ui.allocate_exact_size(vec2(256.0, 256.0), Sense::click());
-
-                    let painter = ui.painter();
-
-                    painter.image(
-                        blurred_texture.id(),
-                        rect,
-                        Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-
-                    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(120));
-                    painter.text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        "已过期\n\n点击刷新二维码",
-                        FontId::proportional(18.0),
-                        Color32::WHITE,
-                    );
-
-                    if response.clicked() {
-                        reconnect = true;
+                    ui.add_space(12.0);
+                    let running = matches!(self.revoke_state, RevokeState::Running);
+                    if ui
+                        .add_enabled(!running, egui::Button::new("重新生成凭据（撤销访问）"))
+                        .clicked()
+                    {
+                        self.trigger_revoke(ui.ctx());
+                    }
+                    match &self.revoke_state {
+                        RevokeState::Idle => {}
+                        RevokeState::Running => {
+                            ui.add_space(4.0);
+                            ui.label("正在请求服务端撤销旧访问...");
+                        }
+                        RevokeState::Success(at) => {
+                            if at.elapsed() < Duration::from_secs(5) {
+                                ui.add_space(4.0);
+                                ui.colored_label(
+                                    Color32::LIGHT_GREEN,
+                                    "已请求撤销，请让手机重新扫码。",
+                                );
+                            }
+                        }
+                        RevokeState::Error(message) => {
+                            ui.add_space(4.0);
+                            ui.colored_label(Color32::YELLOW, message);
+                        }
                     }
                 }
                 AppState::Error { message } => {
@@ -326,10 +416,6 @@ impl eframe::App for App {
                 }
             }
         });
-
-        if reconnect {
-            self.start_grpc(ui.ctx());
-        }
     }
 }
 
@@ -344,6 +430,12 @@ fn start_clipboard_worker(
                 continue;
             }
 
+            let snapshot = if job.auto_paste && job.delete_clipboard_after_paste {
+                Some(clipboard::take_snapshot())
+            } else {
+                None
+            };
+
             if let Err(err) = clipboard::write_to_clipboard(&job.content) {
                 tracing::warn!("Clipboard write failed: {err}");
                 let _ = clipboard_notice_tx.send("写入剪贴板失败，请重试。".to_string());
@@ -353,25 +445,61 @@ fn start_clipboard_worker(
 
             if job.auto_paste {
                 clipboard::simulate_paste(job.paste_delay_ms);
-                if job.enter_after_paste {
-                    clipboard::simulate_enter_key();
+                if let Some(key_spec) = &job.emulation_key_after_paste
+                    && let Some((modifier, key)) = clipboard::parse_key_spec(key_spec)
+                {
+                    clipboard::simulate_key(modifier, key);
                 }
             }
 
-            let notice = if job.auto_paste && job.enter_after_paste {
-                format!("已自动粘贴并回车：{}", job.notice_content)
-            } else if job.auto_paste {
-                format!("已自动粘贴：{}", job.notice_content)
-            } else {
-                format!("已复制到剪贴板：{}", job.notice_content)
-            };
+            let notice = build_clipboard_notice(
+                job.auto_paste,
+                job.emulation_key_after_paste.as_deref(),
+                &job.notice_content,
+            );
             let _ = clipboard_notice_tx.send(notice);
             repaint_ctx.request_repaint();
+
+            if let Some(ref snap) = snapshot
+                && let Err(e) = clipboard::restore_clipboard(snap, &job.content)
+            {
+                tracing::warn!("还原剪贴板失败: {e}");
+            }
         }
     });
 }
 
-fn generate_qr_texture(ctx: &Context, url: &str) -> (TextureHandle, ColorImage) {
+fn build_clipboard_notice(
+    auto_paste: bool,
+    emulation_key_after_paste: Option<&str>,
+    notice_content: &str,
+) -> String {
+    if auto_paste {
+        if let Some(key_spec) = emulation_key_after_paste {
+            format!("已自动粘贴（{key_spec}）：{notice_content}")
+        } else {
+            format!("已自动粘贴：{notice_content}")
+        }
+    } else {
+        format!("已复制到剪贴板：{notice_content}")
+    }
+}
+
+fn public_base_url_from_session_url(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let scheme = parsed.scheme();
+    let host = parsed.host_str()?;
+    let default_port = parsed.port_or_known_default();
+    let explicit_port = parsed.port();
+    let authority = match (explicit_port, default_port) {
+        (Some(port), Some(default)) if port != default => format!("{host}:{port}"),
+        (Some(port), None) => format!("{host}:{port}"),
+        _ => host.to_string(),
+    };
+    Some(format!("{scheme}://{authority}"))
+}
+
+fn generate_qr_texture(ctx: &Context, url: &str) -> TextureHandle {
     use qrcode::QrCode;
 
     let code = match QrCode::new(url.as_bytes()) {
@@ -392,17 +520,16 @@ fn generate_qr_texture(ctx: &Context, url: &str) -> (TextureHandle, ColorImage) 
         .map(|p| egui::Color32::from_gray(p.0[0]))
         .collect();
 
-    let color_image = ColorImage {
+    let color_image = egui::ColorImage {
         size: [w, h],
         pixels,
         source_size: egui::vec2(w as f32, h as f32),
     };
 
-    let texture = ctx.load_texture("qr_code", color_image.clone(), egui::TextureOptions::LINEAR);
-    (texture, color_image)
+    ctx.load_texture("qr_code", color_image, egui::TextureOptions::LINEAR)
 }
 
-fn placeholder_qr_texture(ctx: &Context) -> (TextureHandle, ColorImage) {
+fn placeholder_qr_texture(ctx: &Context) -> TextureHandle {
     let size = 256usize;
     let mut pixels = Vec::with_capacity(size * size);
 
@@ -417,34 +544,62 @@ fn placeholder_qr_texture(ctx: &Context) -> (TextureHandle, ColorImage) {
         }
     }
 
-    let color_image = ColorImage {
+    let color_image = egui::ColorImage {
         size: [size, size],
         pixels,
         source_size: egui::vec2(size as f32, size as f32),
     };
 
-    let texture = ctx.load_texture(
+    ctx.load_texture(
         "qr_code_placeholder",
-        color_image.clone(),
+        color_image,
         egui::TextureOptions::LINEAR,
-    );
-    (texture, color_image)
+    )
 }
 
-fn blur_color_image(src: ColorImage) -> ColorImage {
-    let [w, h] = src.size;
-    let luma_buf: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
-        image::ImageBuffer::from_fn(w as u32, h as u32, |x, y| {
-            image::Luma([src.pixels[y as usize * w + x as usize].r()])
-        });
-    let blurred = image::imageops::blur(&luma_buf, 4.0);
-    let pixels: Vec<egui::Color32> = blurred
-        .pixels()
-        .map(|p| egui::Color32::from_gray(p.0[0]))
-        .collect();
-    ColorImage {
-        size: [w, h],
-        pixels,
-        source_size: egui::vec2(w as f32, h as f32),
+#[cfg(test)]
+mod tests {
+    use super::{build_clipboard_notice, public_base_url_from_session_url};
+
+    #[test]
+    fn clipboard_notice_for_auto_paste_with_key_is_generic() {
+        assert_eq!(
+            build_clipboard_notice(true, Some("ctrl+Return"), "hello"),
+            "已自动粘贴（ctrl+Return）：hello"
+        );
+    }
+
+    #[test]
+    fn clipboard_notice_for_auto_paste_without_key_omits_enter_wording() {
+        assert_eq!(
+            build_clipboard_notice(true, None, "hello"),
+            "已自动粘贴：hello"
+        );
+    }
+
+    #[test]
+    fn clipboard_notice_for_copy_only_is_copy_message() {
+        assert_eq!(
+            build_clipboard_notice(false, Some("Return"), "hello"),
+            "已复制到剪贴板：hello"
+        );
+    }
+
+    #[test]
+    fn public_base_url_from_session_url_extracts_https_origin() {
+        assert_eq!(
+            public_base_url_from_session_url("https://relay.example.com/m/abc#ps=secret")
+                .as_deref(),
+            Some("https://relay.example.com")
+        );
+    }
+
+    #[test]
+    fn public_base_url_from_session_url_keeps_non_default_port() {
+        assert_eq!(
+            public_base_url_from_session_url("https://relay.example.com:8443/m/abc#ps=secret")
+                .as_deref(),
+            Some("https://relay.example.com:8443")
+        );
     }
 }

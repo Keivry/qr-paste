@@ -1,9 +1,73 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use {
+    ipnet::IpNet,
     serde::Deserialize,
-    std::{fmt, fs, net::IpAddr},
+    std::{fmt, fs, net::IpAddr, sync::Arc},
+    url::Url,
 };
+
+#[derive(Clone)]
+pub struct TrustedProxyCidrs {
+    networks: Arc<[IpNet]>,
+}
+
+impl Default for TrustedProxyCidrs {
+    fn default() -> Self {
+        Self {
+            networks: Arc::from([]),
+        }
+    }
+}
+
+impl fmt::Debug for TrustedProxyCidrs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("TrustedProxyCidrs")
+            .field(&self.networks)
+            .finish()
+    }
+}
+
+impl TrustedProxyCidrs {
+    pub fn parse(values: &[String]) -> anyhow::Result<Self> {
+        let mut networks = Vec::with_capacity(values.len());
+        for value in values {
+            let cidr = value.trim();
+            if cidr.is_empty() {
+                anyhow::bail!("trusted_proxy_cidrs 不能包含空字符串");
+            }
+            let network = cidr.parse::<IpNet>().map_err(|err| {
+                anyhow::anyhow!("trusted_proxy_cidrs 包含非法 CIDR `{cidr}`：{err}")
+            })?;
+            networks.push(network);
+        }
+        Ok(Self {
+            networks: Arc::from(networks),
+        })
+    }
+
+    pub fn trusts_peer(&self, peer_ip: IpAddr) -> bool {
+        self.networks
+            .iter()
+            .any(|network| network.contains(&peer_ip))
+    }
+
+    pub fn resolve_client_ip(
+        &self,
+        peer_ip: IpAddr,
+        x_forwarded_for: Option<&str>,
+        x_real_ip: Option<&str>,
+    ) -> IpAddr {
+        if !self.trusts_peer(peer_ip) {
+            return peer_ip;
+        }
+
+        match x_forwarded_for {
+            Some(value) => parse_rightmost_forwarded_ip(value).unwrap_or(peer_ip),
+            None => parse_ip_header(x_real_ip).unwrap_or(peer_ip),
+        }
+    }
+}
 
 /// 服务端配置，从 `server.toml` 中读取。
 ///
@@ -32,6 +96,9 @@ pub struct ServerConfig {
     /// 令牌有效期（秒）。超过此时间未使用的令牌会在清理时被删除。默认 300。
     #[serde(default = "default_token_expiry_secs")]
     pub token_expiry_secs: u64,
+    /// pairing 记录 TTL（秒）。客户端断线后保留该时长以支持免扫码重连。默认 86400。
+    #[serde(default = "default_pairing_ttl_secs")]
+    pub pairing_ttl_secs: u64,
     /// 过期令牌清理任务的执行间隔（秒）。默认 60。
     #[serde(default = "default_token_cleanup_interval_secs")]
     pub token_cleanup_interval_secs: u64,
@@ -50,7 +117,7 @@ pub struct ServerConfig {
     /// WebSocket 连接最大空闲时间（秒）。超时后服务端主动断开连接。默认 90。
     #[serde(default = "default_ws_idle_timeout_secs")]
     pub ws_idle_timeout_secs: u64,
-    /// gRPC HTTP/2 keepalive 心跳发送间隔（秒）。默认 30。
+    /// gRPC HTTP/2 keepalive 心跳发送间隔（秒）。默认 60。
     #[serde(default = "default_grpc_keepalive_interval_secs")]
     pub grpc_keepalive_interval_secs: u64,
     /// gRPC HTTP/2 keepalive 超时（秒）。超过此时间未收到 ACK 则断开连接。默认 20。
@@ -59,13 +126,13 @@ pub struct ServerConfig {
     /// 日志级别：`trace` / `debug` / `info` / `warn` / `error`。默认 `"info"`。
     #[serde(default = "default_log_level")]
     pub log_level: String,
-    /// 是否部署在可信反向代理之后（nginx/caddy 等）。
+    /// 可信反向代理 CIDR 白名单。默认空列表，表示不信任任何代理头。
     ///
-    /// 设为 `true` 时，限速器使用 `X-Forwarded-For` / `X-Real-IP` 头中的 IP；
-    /// 设为 `false`（默认）时，使用直连的对端 IP，防止伪造来源绕过限速。
-    /// 如果不确定，保持默认 `false`。
+    /// 仅当 TCP 对端 IP 落在这些 CIDR 内时，才会解析 `X-Forwarded-For`
+    /// 最右侧 IP；若该头缺失，则尝试 `X-Real-IP`。若头部缺失或格式非法，
+    /// 则回退到 TCP 对端 IP。
     #[serde(default)]
-    pub behind_trusted_proxy: bool,
+    pub trusted_proxy_cidrs: Vec<String>,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -78,6 +145,7 @@ impl fmt::Debug for ServerConfig {
             .field("http_bind_host", &self.http_bind_host)
             .field("grpc_bind_host", &self.grpc_bind_host)
             .field("token_expiry_secs", &self.token_expiry_secs)
+            .field("pairing_ttl_secs", &self.pairing_ttl_secs)
             .field(
                 "token_cleanup_interval_secs",
                 &self.token_cleanup_interval_secs,
@@ -102,7 +170,7 @@ impl fmt::Debug for ServerConfig {
                 &self.grpc_keepalive_timeout_secs,
             )
             .field("log_level", &self.log_level)
-            .field("behind_trusted_proxy", &self.behind_trusted_proxy)
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .finish()
     }
 }
@@ -111,13 +179,14 @@ fn default_grpc_port() -> u16 { 50051 }
 fn default_http_port() -> u16 { 8080 }
 fn default_bind_host() -> IpAddr { IpAddr::from([127, 0, 0, 1]) }
 fn default_token_expiry_secs() -> u64 { 300 }
+fn default_pairing_ttl_secs() -> u64 { 86400 }
 fn default_token_cleanup_interval_secs() -> u64 { 60 }
 fn default_ws_rate_limit_per_ip_per_min() -> u32 { 10 }
 fn default_http_rate_limit_per_ip_per_min() -> u32 { 20 }
 fn default_max_ws_connections() -> usize { 100 }
 fn default_max_message_size_bytes() -> usize { 65536 }
 fn default_ws_idle_timeout_secs() -> u64 { 90 }
-fn default_grpc_keepalive_interval_secs() -> u64 { 30 }
+fn default_grpc_keepalive_interval_secs() -> u64 { 60 }
 fn default_grpc_keepalive_timeout_secs() -> u64 { 20 }
 fn default_log_level() -> String { "info".to_string() }
 
@@ -148,6 +217,7 @@ impl ServerConfig {
                 "警告：grpc_auth_token 长度不足 16 字符，建议使用高熵随机值以确保安全性。"
             );
         }
+        validate_public_base_url(&self.public_base_url)?;
         if self.ws_rate_limit_per_ip_per_min == 0 {
             anyhow::bail!("ws_rate_limit_per_ip_per_min 必须大于 0");
         }
@@ -166,11 +236,89 @@ impl ServerConfig {
         if self.token_expiry_secs == 0 {
             anyhow::bail!("token_expiry_secs 必须大于 0");
         }
+        if self.pairing_ttl_secs == 0 {
+            anyhow::bail!("pairing_ttl_secs 必须大于 0");
+        }
         if self.ws_idle_timeout_secs == 0 {
             anyhow::bail!("ws_idle_timeout_secs 必须大于 0");
         }
+        let _ = self.trusted_proxy_ranges()?;
         Ok(())
     }
+
+    pub fn normalized_public_origin(&self) -> anyhow::Result<String> {
+        normalize_origin(&self.public_base_url)
+    }
+
+    pub fn trusted_proxy_ranges(&self) -> anyhow::Result<TrustedProxyCidrs> {
+        TrustedProxyCidrs::parse(&self.trusted_proxy_cidrs)
+    }
+}
+
+fn parse_rightmost_forwarded_ip(value: &str) -> Option<IpAddr> {
+    value
+        .split(',')
+        .next_back()
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .and_then(|entry| entry.parse::<IpAddr>().ok())
+}
+
+fn parse_ip_header(value: Option<&str>) -> Option<IpAddr> {
+    value
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .and_then(|entry| entry.parse::<IpAddr>().ok())
+}
+
+fn validate_public_base_url(public_base_url: &str) -> anyhow::Result<()> {
+    let url = Url::parse(public_base_url)
+        .map_err(|err| anyhow::anyhow!("public_base_url 不是合法 URL：{err}"))?;
+
+    if url.username() != "" || url.password().is_some() {
+        anyhow::bail!("public_base_url 不能包含 userinfo");
+    }
+    if url.query().is_some() {
+        anyhow::bail!("public_base_url 不能包含 query");
+    }
+    if url.fragment().is_some() {
+        anyhow::bail!("public_base_url 不能包含 fragment");
+    }
+    if url.path() != "" && url.path() != "/" {
+        anyhow::bail!("public_base_url 不能包含非根路径");
+    }
+
+    if url.scheme() == "http" {
+        let host = url.host_str().unwrap_or("");
+        let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+        if !is_loopback {
+            anyhow::bail!(
+                "public_base_url 必须使用 https:// 协议（生产环境）；\
+                 检测到非 loopback 地址的 http:// 配置"
+            );
+        }
+    }
+
+    let _ = normalize_origin(public_base_url)?;
+    Ok(())
+}
+
+fn normalize_origin(value: &str) -> anyhow::Result<String> {
+    let url = Url::parse(value).map_err(|err| anyhow::anyhow!("origin 解析失败：{err}"))?;
+    let scheme = url.scheme().to_ascii_lowercase();
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("origin 缺少主机名"))?
+        .to_ascii_lowercase();
+    let port = url.port();
+    let normalized = match (scheme.as_str(), port) {
+        ("http", None | Some(80)) | ("https", None | Some(443)) => {
+            format!("{scheme}://{host}")
+        }
+        (_, Some(port)) => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    };
+    Ok(normalized.trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -205,9 +353,10 @@ mod tests {
         assert_eq!(cfg.max_ws_connections, 100);
         assert_eq!(cfg.max_message_size_bytes, 65536);
         assert_eq!(cfg.ws_idle_timeout_secs, 90);
-        assert_eq!(cfg.grpc_keepalive_interval_secs, 30);
+        assert_eq!(cfg.grpc_keepalive_interval_secs, 60);
         assert_eq!(cfg.grpc_keepalive_timeout_secs, 20);
         assert_eq!(cfg.log_level, "info");
+        assert!(cfg.trusted_proxy_cidrs.is_empty());
     }
 
     #[test]
@@ -222,6 +371,7 @@ mod tests {
             http_bind_host = "0.0.0.0"
             token_expiry_secs = 600
             log_level = "debug"
+            trusted_proxy_cidrs = ["127.0.0.1/32", "10.0.0.0/8"]
             "#,
         );
         assert_eq!(cfg.public_base_url, "https://relay.example.com");
@@ -232,8 +382,72 @@ mod tests {
         assert_eq!(cfg.http_bind_host, IpAddr::from([0, 0, 0, 0]));
         assert_eq!(cfg.token_expiry_secs, 600);
         assert_eq!(cfg.log_level, "debug");
+        assert_eq!(
+            cfg.trusted_proxy_cidrs,
+            vec!["127.0.0.1/32".to_string(), "10.0.0.0/8".to_string()]
+        );
         // 未覆盖的字段仍使用默认值
         assert_eq!(cfg.ws_idle_timeout_secs, 90);
+    }
+
+    #[test]
+    fn invalid_trusted_proxy_cidr_rejected_at_validation() {
+        let cfg = parse(
+            r#"
+            public_base_url = "https://relay.example.com"
+            grpc_auth_token = "shared-secret"
+            trusted_proxy_cidrs = ["not-a-cidr"]
+            "#,
+        );
+        let error = cfg
+            .validate()
+            .expect_err("invalid trusted_proxy_cidrs should fail validation");
+        assert!(error.to_string().contains("trusted_proxy_cidrs"));
+    }
+
+    #[test]
+    fn trusted_proxy_ranges_use_rightmost_x_forwarded_for_for_trusted_peer() {
+        let trusted = TrustedProxyCidrs::parse(&["127.0.0.0/8".to_string()])
+            .expect("trusted proxies should parse");
+        let resolved = trusted.resolve_client_ip(
+            IpAddr::from([127, 0, 0, 1]),
+            Some("198.51.100.10, 203.0.113.7"),
+            Some("192.0.2.5"),
+        );
+        assert_eq!(resolved, IpAddr::from([203, 0, 113, 7]));
+    }
+
+    #[test]
+    fn trusted_proxy_ranges_fall_back_to_x_real_ip_only_when_xff_missing() {
+        let trusted = TrustedProxyCidrs::parse(&["127.0.0.0/8".to_string()])
+            .expect("trusted proxies should parse");
+        let resolved =
+            trusted.resolve_client_ip(IpAddr::from([127, 0, 0, 1]), None, Some("192.0.2.5"));
+        assert_eq!(resolved, IpAddr::from([192, 0, 2, 5]));
+    }
+
+    #[test]
+    fn trusted_proxy_ranges_ignore_headers_for_untrusted_peer() {
+        let trusted = TrustedProxyCidrs::parse(&["127.0.0.1/32".to_string()])
+            .expect("trusted proxies should parse");
+        let resolved = trusted.resolve_client_ip(
+            IpAddr::from([10, 0, 0, 5]),
+            Some("203.0.113.7"),
+            Some("192.0.2.5"),
+        );
+        assert_eq!(resolved, IpAddr::from([10, 0, 0, 5]));
+    }
+
+    #[test]
+    fn trusted_proxy_ranges_fall_back_to_peer_ip_on_invalid_xff() {
+        let trusted = TrustedProxyCidrs::parse(&["127.0.0.0/8".to_string()])
+            .expect("trusted proxies should parse");
+        let resolved = trusted.resolve_client_ip(
+            IpAddr::from([127, 0, 0, 1]),
+            Some("not-an-ip"),
+            Some("192.0.2.5"),
+        );
+        assert_eq!(resolved, IpAddr::from([127, 0, 0, 1]));
     }
 
     #[test]
@@ -311,5 +525,30 @@ mod tests {
             .validate()
             .expect_err("zero ws_idle_timeout_secs should fail validation");
         assert!(error.to_string().contains("ws_idle_timeout_secs"));
+    }
+
+    #[test]
+    fn http_non_loopback_rejected_at_validation() {
+        let cfg = parse(
+            r#"
+            public_base_url = "http://relay.example.com"
+            grpc_auth_token = "shared-secret"
+            "#,
+        );
+        let error = cfg
+            .validate()
+            .expect_err("http:// non-loopback should fail validation");
+        assert!(error.to_string().contains("https://"));
+    }
+
+    #[test]
+    fn http_localhost_allowed_at_validation() {
+        let cfg = parse(
+            r#"
+            public_base_url = "http://localhost:8080"
+            grpc_auth_token = "shared-secret"
+            "#,
+        );
+        cfg.validate().expect("http://localhost should be allowed");
     }
 }

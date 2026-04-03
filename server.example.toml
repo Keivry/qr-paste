@@ -20,6 +20,9 @@ grpc_bind_host = "127.0.0.1"
 # 令牌有效期（秒），默认 300（5 分钟）
 token_expiry_secs = 300
 
+# pairing 记录保留时长（秒），默认 86400（24 小时）
+pairing_ttl_secs = 86400
+
 # 令牌清理间隔（秒），默认 60
 token_cleanup_interval_secs = 60
 
@@ -38,8 +41,8 @@ max_message_size_bytes = 65536
 # WebSocket 空闲超时（秒），默认 90
 ws_idle_timeout_secs = 90
 
-# gRPC keepalive 心跳间隔（秒），默认 30
-grpc_keepalive_interval_secs = 30
+# gRPC keepalive 心跳间隔（秒），默认 60
+grpc_keepalive_interval_secs = 60
 
 # gRPC keepalive 超时（秒），默认 20
 grpc_keepalive_timeout_secs = 20
@@ -47,5 +50,9 @@ grpc_keepalive_timeout_secs = 20
 # 日志级别：trace / debug / info / warn / error，默认 info
 log_level = "info"
 
-# 若部署在可信反向代理之后并希望按 X-Forwarded-For / X-Real-IP 限流，可设为 true
-behind_trusted_proxy = false
+# 可信反向代理 CIDR 白名单；默认空列表，表示始终使用 TCP peer IP
+# 只有当连接来源 IP 命中这些 CIDR 时，服务端才会信任代理覆写的头部：
+# 1) 优先取 X-Forwarded-For 最右侧 IP；2) 若 XFF 缺失，则取 X-Real-IP；
+# 3) 若头部缺失或格式非法，则回退到 TCP peer IP
+# 仅在你明确知道反向代理出口 IP / 网段时填写，例如：["127.0.0.1/32"]
+trusted_proxy_cidrs = []

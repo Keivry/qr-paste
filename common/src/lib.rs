@@ -7,12 +7,15 @@ use serde::{Deserialize, Serialize};
 /// 使用带 `type` 标签的 JSON 格式序列化，例如：
 /// ```json
 /// {"type":"clipboard_text","content":"hello"}
+/// {"type":"ping"}
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MobileMessage {
     /// 用户在手机页面输入并发送的文本内容，目标是写入 PC 剪贴板。
     ClipboardText { content: String },
+    /// 应用层心跳探测，服务端应回复 `Pong`。
+    Ping,
 }
 
 /// 服务端发送给手机端的 WebSocket 消息。
@@ -21,6 +24,7 @@ pub enum MobileMessage {
 /// ```json
 /// {"type":"client_disconnected"}
 /// {"type":"error","message":"PC client not connected"}
+/// {"type":"pong"}
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -29,6 +33,8 @@ pub enum ServerToMobileMessage {
     ClientDisconnected,
     /// 发生错误，`message` 字段包含人类可读的描述。
     Error { message: String },
+    /// 响应手机端发来的 `Ping`。
+    Pong,
 }
 
 #[cfg(test)]
@@ -45,7 +51,28 @@ mod tests {
         let parsed: MobileMessage = serde_json::from_str(&json).unwrap();
         match parsed {
             MobileMessage::ClipboardText { content } => assert_eq!(content, "hello"),
+            MobileMessage::Ping => panic!("unexpected Ping variant"),
         }
+    }
+
+    #[test]
+    fn mobile_message_ping_roundtrip() {
+        let json = serde_json::to_string(&MobileMessage::Ping).unwrap();
+        assert_eq!(json, r#"{"type":"ping"}"#);
+        assert!(matches!(
+            serde_json::from_str::<MobileMessage>(&json).unwrap(),
+            MobileMessage::Ping
+        ));
+    }
+
+    #[test]
+    fn server_to_mobile_pong_roundtrip() {
+        let json = serde_json::to_string(&ServerToMobileMessage::Pong).unwrap();
+        assert_eq!(json, r#"{"type":"pong"}"#);
+        assert!(matches!(
+            serde_json::from_str::<ServerToMobileMessage>(&json).unwrap(),
+            ServerToMobileMessage::Pong
+        ));
     }
 
     #[test]
