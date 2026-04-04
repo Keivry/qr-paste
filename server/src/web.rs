@@ -312,6 +312,9 @@ fn header_value<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a st
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
+/// 提供手机端配对页面（`GET /m/:pairing_id`）。
+///
+/// 验证 pairing_id 存在后渲染内嵌 HTML，注入随机 nonce 并设置严格的 CSP 头。
 async fn handle_mobile_page(
     Path(pairing_id): Path<String>,
     State(state): State<AppState>,
@@ -332,21 +335,26 @@ async fn handle_mobile_page(
         .replace("__NONCE__", &nonce);
     let mut response = Html(html).into_response();
     apply_common_headers(response.headers_mut());
-    response.headers_mut().insert(
-        CONTENT_SECURITY_POLICY,
-        HeaderValue::from_str(&format!(
-            "default-src 'self'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; worker-src 'none'"
-        ))
-        .expect("valid csp"),
-    );
+    let Ok(csp_value) = HeaderValue::from_str(&format!(
+        "default-src 'self'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; worker-src 'none'"
+    )) else {
+        return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    };
+    response
+        .headers_mut()
+        .insert(CONTENT_SECURITY_POLICY, csp_value);
     response
         .headers_mut()
         .insert(X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     response
 }
 
+/// 旧版 `GET /pair/:id` 端点已废弃，固定返回 `410 Gone`。
 async fn handle_deprecated_pairing_get() -> Response { error_json(StatusCode::GONE, "gone") }
 
+/// 处理首次配对认证（`POST /pair/:pairing_id/bootstrap`）。
+///
+/// 手机端提交 pairing_secret 后，创建浏览器会话并在响应中写入 session cookie。
 async fn handle_bootstrap(
     Path(pairing_id): Path<String>,
     State(state): State<AppState>,
@@ -456,17 +464,21 @@ async fn handle_bootstrap(
     }))
     .into_response();
     apply_common_headers(response.headers_mut());
-    response.headers_mut().append(
-        SET_COOKIE,
-        HeaderValue::from_str(&format!(
-            "{BROWSER_SESSION_COOKIE}={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000",
-            encode_hex(&session_id)
-        ))
-        .expect("valid cookie"),
-    );
+    let Ok(cookie_value) = HeaderValue::from_str(&format!(
+        "{BROWSER_SESSION_COOKIE}={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000",
+        encode_hex(&session_id)
+    )) else {
+        return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    };
+    response
+        .headers_mut()
+        .append(SET_COOKIE, cookie_value);
     response
 }
 
+/// 返回当前配对及 PC 客户端的在线状态（`POST /pair/:pairing_id/status`）。
+///
+/// 需要有效的浏览器会话 cookie；PC 不在线时响应中包含轮询建议间隔。
 async fn handle_status(
     Path(pairing_id): Path<String>,
     State(state): State<AppState>,
@@ -513,6 +525,9 @@ async fn handle_status(
     response
 }
 
+/// 签发短效 WebSocket 票据（`POST /pair/:pairing_id/ws-ticket`），有效期 15 秒。
+///
+/// 票据通过 `Sec-WebSocket-Protocol` 头在握手时一次性使用，之后立即失效。
 async fn handle_ws_ticket(
     Path(pairing_id): Path<String>,
     State(state): State<AppState>,
@@ -569,6 +584,9 @@ async fn handle_ws_ticket(
     response
 }
 
+/// 撤销指定配对的所有浏览器会话（`POST /pair/:pairing_id/revoke`）。
+///
+/// 需要 PC 客户端的 gRPC Bearer 令牌认证；通过递增 epoch 使现有会话 cookie 全部失效。
 async fn handle_revoke(
     Path(pairing_id): Path<String>,
     State(state): State<AppState>,
@@ -645,6 +663,10 @@ async fn handle_revoke(
     response
 }
 
+/// 将 HTTP 连接升级为 WebSocket（`GET /ws/:id`）。
+///
+/// 根据是否存在 `Sec-WebSocket-Protocol` 票据头，分别走手机端配对通道或
+/// 遗留会话通道；升级后进入 [`handle_pairing_ws`] 消息循环。
 async fn handle_ws_upgrade(
     Path(id): Path<String>,
     State(state): State<AppState>,

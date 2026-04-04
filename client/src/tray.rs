@@ -10,6 +10,7 @@ pub enum TrayEvent {
     Quit,
 }
 
+/// 系统托盘句柄；持有 [`tray_icon::TrayIcon`] 并在 Drop 时清除事件处理器。
 pub struct Tray {
     _icon: tray_icon::TrayIcon,
 }
@@ -21,13 +22,16 @@ impl Drop for Tray {
     }
 }
 
+/// 创建系统托盘图标并注册事件处理器，将用户操作通过 `tx` 发送并触发 egui 重绘。
+///
+/// 返回的 [`Tray`] 必须在应用生命周期内保持存活；drop 后托盘和菜单事件将停止响应。
 pub fn start(tx: mpsc::Sender<TrayEvent>, repaint_ctx: egui::Context) -> Result<Tray, String> {
     use tray_icon::{
+        menu::{Menu, MenuEvent, MenuItem},
         MouseButton,
         MouseButtonState,
         TrayIconBuilder,
         TrayIconEvent,
-        menu::{Menu, MenuEvent, MenuItem},
     };
 
     let menu = Menu::new();

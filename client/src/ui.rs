@@ -53,6 +53,9 @@ struct ClipboardJob {
     notice_content: String,
 }
 
+/// egui 应用主状态，实现 [`eframe::App`] 接口。
+///
+/// 持有配置、gRPC 事件通道、系统托盘句柄及剪贴板操作通道。
 pub struct App {
     config: ClientConfig,
     state: AppState,
@@ -156,19 +159,15 @@ impl App {
         self.revoke_state = RevokeState::Idle;
     }
 
-    fn revoke_endpoint_url(&self) -> String {
-        let base = self
-            .last_public_base_url
-            .as_deref()
-            .unwrap_or(self.config.server_host.trim())
-            .trim_end_matches('/');
+    fn revoke_endpoint_url(&self) -> Option<String> {
+        let base = self.last_public_base_url.as_deref()?.trim_end_matches('/');
         if base.starts_with("http://") || base.starts_with("https://") {
-            format!("{base}/api/pairing/{}/revoke", self.config.pairing_id)
+            Some(format!("{base}/api/pairing/{}/revoke", self.config.pairing_id))
         } else {
-            format!(
+            Some(format!(
                 "http://{base}/api/pairing/{}/revoke",
                 self.config.pairing_id
-            )
+            ))
         }
     }
 
@@ -179,7 +178,11 @@ impl App {
             return;
         };
 
-        let url = self.revoke_endpoint_url();
+        let Some(url) = self.revoke_endpoint_url() else {
+            self.revoke_state =
+                RevokeState::Error("尚未获取到服务端地址，无法撤销访问。".to_string());
+            return;
+        };
         let repaint_ctx = ctx.clone();
         self.revoke_state = RevokeState::Running;
 
@@ -278,10 +281,12 @@ impl eframe::App for App {
                             if content.is_empty() {
                                 continue;
                             }
-                            let notice_content = if content.chars().count() > 20 {
-                                format!("{}...", content.chars().take(20).collect::<String>())
+                            let mut chars = content.chars();
+                            let prefix: String = chars.by_ref().take(20).collect();
+                            let notice_content = if chars.next().is_some() {
+                                format!("{prefix}...")
                             } else {
-                                content.clone()
+                                prefix
                             };
                             let _ = self.clipboard_job_tx.send(ClipboardJob {
                                 content,

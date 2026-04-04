@@ -1,0 +1,27 @@
+# cargo-audit 配置
+# 以下警告均为无法直接修复的传递依赖问题，已在此处显式说明原因后忽略。
+
+[advisories]
+ignore = [
+    # GTK3 bindings 已不再维护（atk、atk-sys、gdk、gdk-sys、gtk、gtk-sys、gtk3-macros、gio、gdk-pixbuf）
+    # 这些依赖仅在 Linux 平台构建 client 时通过 tray-icon → muda/libappindicator 引入，
+    # 与服务端无关；客户端正式发布目标为 Windows，无修复上游版本可用。
+    "RUSTSEC-2024-0413",  # atk
+    "RUSTSEC-2024-0416",  # atk-sys
+    "RUSTSEC-2024-0412",  # gdk
+    "RUSTSEC-2024-0418",  # gdk-sys
+    "RUSTSEC-2024-0415",  # gtk
+    "RUSTSEC-2024-0420",  # gtk-sys
+    "RUSTSEC-2024-0419",  # gtk3-macros
+
+    # glib：Iterator/DoubleEndedIterator impl 未健全（仅 Linux GTK 链路引入，同上）
+    "RUSTSEC-2024-0429",  # glib
+
+    # proc-macro-error：已不再维护（通过 glib-macros → GTK 链路引入，同上）
+    "RUSTSEC-2024-0370",  # proc-macro-error
+
+    # paste：已不再维护（通过 rav1e → ravif → image 链路引入）
+    # rav1e 是 image crate 的可选 AVIF 编解码后端，本项目仅用 image 解码 PNG 图标；
+    # 无可用的修复上游版本。
+    "RUSTSEC-2024-0436",  # paste
+]

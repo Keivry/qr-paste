@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! 配对状态管理：配对条目、浏览器会话、WebSocket 票据及其存储的创建、验证与清理。
+
 use {
     crate::{config::ServerConfig, session::SessionStore},
     dashmap::DashMap,
@@ -106,12 +108,18 @@ pub type PairingStore = Arc<DashMap<Uuid, PairingEntry>>;
 pub type BrowserSessionStore = Arc<DashMap<[u8; 32], BrowserSession>>;
 pub type WsTicketStore = Arc<DashMap<[u8; 32], WsTicket>>;
 
+/// 创建一个空的配对条目存储。
 pub fn new_pairing_store() -> PairingStore { Arc::new(DashMap::new()) }
 
+/// 创建一个空的浏览器会话存储。
 pub fn new_browser_session_store() -> BrowserSessionStore { Arc::new(DashMap::new()) }
 
+/// 创建一个空的 WebSocket 票据存储。
 pub fn new_ws_ticket_store() -> WsTicketStore { Arc::new(DashMap::new()) }
 
+/// 使用常量时间比较验证配对密钥，防止时序攻击。
+///
+/// `provided_hex` 必须是 64 个小写十六进制字符，否则直接返回 `false`。
 pub fn verify_secret(entry: &PairingEntry, provided_hex: &str) -> bool {
     if !secret_regex().is_match(provided_hex) {
         return false;
@@ -124,6 +132,8 @@ pub fn verify_secret(entry: &PairingEntry, provided_hex: &str) -> bool {
     bool::from(entry.pairing_secret.ct_eq(&decoded))
 }
 
+/// 在配对 ID 不存在时执行一次无意义的常量时间比较，使响应时间与"ID 存在但密钥错误"
+/// 的情况保持一致，避免通过时序差异枚举有效配对 ID。
 pub fn constant_time_dummy_compare(provided_hex: &str) {
     let Ok(decoded) = decode_hex_32(provided_hex) else {
         return;
@@ -131,17 +141,20 @@ pub fn constant_time_dummy_compare(provided_hex: &str) {
     let _ = bool::from(decoded.ct_eq(&[0_u8; 32]));
 }
 
+/// 返回用于验证 64 字符小写十六进制密钥格式的编译后正则表达式（惰性初始化单例）。
 pub fn secret_regex() -> &'static Regex {
     static REGEX: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     REGEX.get_or_init(|| Regex::new(r"^[0-9a-f]{64}$").expect("valid regex"))
 }
 
+/// 生成 32 个加密安全的随机字节。
 pub fn random_bytes_32() -> anyhow::Result<[u8; 32]> {
     let mut bytes = [0_u8; 32];
     rand::rng().fill(&mut bytes[..]);
     Ok(bytes)
 }
 
+/// 将字节切片编码为小写十六进制字符串，输出长度为 `bytes.len() * 2`。
 pub fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -152,6 +165,9 @@ pub fn encode_hex(bytes: &[u8]) -> String {
     output
 }
 
+/// 将 64 字符小写十六进制字符串解码为 32 字节数组。
+///
+/// 输入长度不为 64 或包含非十六进制字符时返回 `Err(())`。
 pub fn decode_hex_32(value: &str) -> Result<[u8; 32], ()> {
     if value.len() != 64 {
         return Err(());
@@ -172,6 +188,10 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, ()> {
     }
 }
 
+/// 启动后台清理任务，按 `config.token_cleanup_interval_secs` 周期性删除：
+/// 已过期的会话令牌、离线且过期的配对条目，以及对应的浏览器会话和 WS 票据。
+///
+/// 收到 `cancellation` 信号后退出。
 pub fn spawn_cleanup_task(
     config: Arc<ServerConfig>,
     session_store: SessionStore,
