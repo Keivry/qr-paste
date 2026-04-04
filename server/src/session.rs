@@ -18,7 +18,7 @@ pub struct Session {
     pub token: String,
     /// 会话创建时刻，用于计算是否超过 `token_expiry_secs`。
     pub created_at: Instant,
-    /// 是否已被手机端扫描过。令牌一旦扫描即置为 `true`，防止重复使用。
+    /// 兼容旧流程保留的遗留字段，当前已不再写入 `true`；新逻辑应使用 `pairing_id` 跟踪配对关系。
     #[allow(dead_code)]
     pub scanned: bool,
     /// 手机端发起 WebSocket 升级时记录的预留时刻。

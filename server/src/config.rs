@@ -213,8 +213,8 @@ impl ServerConfig {
             anyhow::bail!("server.toml 中必须填写 grpc_auth_token");
         }
         if self.grpc_auth_token.len() < 16 {
-            tracing::warn!(
-                "警告：grpc_auth_token 长度不足 16 字符，建议使用高熵随机值以确保安全性。"
+            anyhow::bail!(
+                "server.toml 中的 grpc_auth_token 长度不足 16 字符，请使用高熵随机值以确保安全性。"
             );
         }
         validate_public_base_url(&self.public_base_url)?;
@@ -366,6 +366,9 @@ fn normalize_origin(value: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    const VALID_GRPC_AUTH_TOKEN: &str = "shared-secret-xx";
+    const ANOTHER_VALID_GRPC_AUTH_TOKEN: &str = "another-secret-yy";
+
     fn parse(toml: &str) -> ServerConfig { toml::from_str(toml).expect("parse failed") }
 
     #[test]
@@ -380,7 +383,7 @@ mod tests {
         let cfg = parse(
             r#"
             public_base_url = "https://example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             "#,
         );
         assert_eq!(cfg.grpc_port, 50051);
@@ -405,7 +408,7 @@ mod tests {
         let cfg = parse(
             r#"
             public_base_url = "https://relay.example.com"
-            grpc_auth_token = "another-secret"
+            grpc_auth_token = "another-secret-yy"
             grpc_port = 9090
             http_port = 8443
             grpc_bind_host = "0.0.0.0"
@@ -416,7 +419,7 @@ mod tests {
             "#,
         );
         assert_eq!(cfg.public_base_url, "https://relay.example.com");
-        assert_eq!(cfg.grpc_auth_token, "another-secret");
+        assert_eq!(cfg.grpc_auth_token, ANOTHER_VALID_GRPC_AUTH_TOKEN);
         assert_eq!(cfg.grpc_port, 9090);
         assert_eq!(cfg.http_port, 8443);
         assert_eq!(cfg.grpc_bind_host, IpAddr::from([0, 0, 0, 0]));
@@ -436,7 +439,7 @@ mod tests {
         let cfg = parse(
             r#"
             public_base_url = "https://relay.example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             trusted_proxy_cidrs = ["not-a-cidr"]
             "#,
         );
@@ -498,7 +501,7 @@ mod tests {
         let cfg = parse(
             r#"
             public_base_url = ""
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             "#,
         );
         assert!(cfg.public_base_url.is_empty());
@@ -524,11 +527,25 @@ mod tests {
     }
 
     #[test]
+    fn short_grpc_auth_token_rejected_at_validation() {
+        let cfg = parse(
+            r#"
+            public_base_url = "https://relay.example.com"
+            grpc_auth_token = "short-token"
+            "#,
+        );
+        let error = cfg
+            .validate()
+            .expect_err("short grpc_auth_token should fail validation");
+        assert!(error.to_string().contains("grpc_auth_token"));
+    }
+
+    #[test]
     fn zero_token_cleanup_interval_rejected_at_validation() {
         let cfg = parse(
             r#"
             public_base_url = "https://relay.example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             token_cleanup_interval_secs = 0
             "#,
         );
@@ -543,7 +560,7 @@ mod tests {
         let cfg = parse(
             r#"
             public_base_url = "https://relay.example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             token_expiry_secs = 0
             "#,
         );
@@ -558,7 +575,7 @@ mod tests {
         let cfg = parse(
             r#"
             public_base_url = "https://relay.example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             ws_idle_timeout_secs = 0
             "#,
         );
@@ -573,7 +590,7 @@ mod tests {
         let cfg = parse(
             r#"
             public_base_url = "http://relay.example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             "#,
         );
         let error = cfg
@@ -587,7 +604,7 @@ mod tests {
         let cfg = parse(
             r#"
             public_base_url = "http://localhost:8080"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             "#,
         );
         cfg.validate().expect("http://localhost should be allowed");
@@ -595,8 +612,10 @@ mod tests {
 
     #[test]
     fn http_ipv6_loopback_allowed_at_validation() {
-        let toml = "public_base_url = \"http://[::1]:8080\"\ngrpc_auth_token = \"shared-secret\"";
-        let cfg = parse(toml);
+        let toml = format!(
+            "public_base_url = \"http://[::1]:8080\"\ngrpc_auth_token = \"{VALID_GRPC_AUTH_TOKEN}\""
+        );
+        let cfg = parse(&toml);
         cfg.validate()
             .expect("http://[::1] should be allowed for local dev");
     }
@@ -604,7 +623,9 @@ mod tests {
     #[test]
     fn https_loopback_rejected_at_validation() {
         for url in &["https://127.0.0.1", "https://localhost", "https://[::1]"] {
-            let toml = format!("public_base_url = \"{url}\"\ngrpc_auth_token = \"shared-secret\"");
+            let toml = format!(
+                "public_base_url = \"{url}\"\ngrpc_auth_token = \"{VALID_GRPC_AUTH_TOKEN}\""
+            );
             let cfg = parse(&toml);
             cfg.validate()
                 .expect_err(&format!("https loopback {url} should be rejected"));
@@ -620,7 +641,9 @@ mod tests {
             "https://172.31.255.255",
             "https://169.254.1.1",
         ] {
-            let toml = format!("public_base_url = \"{url}\"\ngrpc_auth_token = \"shared-secret\"");
+            let toml = format!(
+                "public_base_url = \"{url}\"\ngrpc_auth_token = \"{VALID_GRPC_AUTH_TOKEN}\""
+            );
             let cfg = parse(&toml);
             cfg.validate()
                 .expect_err(&format!("https private {url} should be rejected"));
@@ -635,7 +658,9 @@ mod tests {
             "https://[fe80::1]",
             "https://[febf::1]",
         ] {
-            let toml = format!("public_base_url = \"{url}\"\ngrpc_auth_token = \"shared-secret\"");
+            let toml = format!(
+                "public_base_url = \"{url}\"\ngrpc_auth_token = \"{VALID_GRPC_AUTH_TOKEN}\""
+            );
             let cfg = parse(&toml);
             cfg.validate()
                 .expect_err(&format!("https IPv6 non-public {url} should be rejected"));

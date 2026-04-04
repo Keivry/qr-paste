@@ -104,6 +104,7 @@ type KeyedLimiter<K> = Arc<RateLimiter<K, DefaultKeyedStateStore<K>, DefaultCloc
 static MOBILE_HTML: &str = include_str!("web/index.html");
 
 #[derive(Clone)]
+/// 注入到全部 HTTP 处理器中的共享服务端状态。
 pub struct AppState {
     pub store: SessionStore,
     pub pairing_store: PairingStore,
@@ -149,6 +150,7 @@ impl KeyExtractor for TrustedClientIpKeyExtractor {
     }
 }
 
+/// 绑定 HTTP 监听地址并运行 Axum 路由服务。
 pub async fn serve(
     addr: SocketAddr,
     store: SessionStore,
@@ -353,10 +355,10 @@ async fn handle_mobile_page(
     response
 }
 
-/// 旧版 `GET /pair/:id` 端点已废弃，固定返回 `410 Gone`。
+/// 旧版 `GET /api/pairing/{pairing_id}` 端点已废弃，固定返回 `410 Gone`。
 async fn handle_deprecated_pairing_get() -> Response { error_json(StatusCode::GONE, "gone") }
 
-/// 处理首次配对认证（`POST /pair/:pairing_id/bootstrap`）。
+/// 处理首次配对认证（`POST /api/pairing/{pairing_id}/bootstrap`）。
 ///
 /// 手机端提交 pairing_secret 后，创建浏览器会话并在响应中写入 session cookie。
 async fn handle_bootstrap(
@@ -478,7 +480,7 @@ async fn handle_bootstrap(
     response
 }
 
-/// 返回当前配对及 PC 客户端的在线状态（`POST /pair/:pairing_id/status`）。
+/// 返回当前配对及 PC 客户端的在线状态（`POST /api/pairing/{pairing_id}/status`）。
 ///
 /// 需要有效的浏览器会话 cookie；PC 不在线时响应固定包含 `retry_after_ms: 1000`。
 async fn handle_status(
@@ -527,7 +529,7 @@ async fn handle_status(
     response
 }
 
-/// 签发短效 WebSocket 票据（`POST /pair/:pairing_id/ws-ticket`），有效期 15 秒。
+/// 签发短效 WebSocket 票据（`POST /api/pairing/{pairing_id}/ws-ticket`），有效期 15 秒。
 ///
 /// 票据通过 `Sec-WebSocket-Protocol` 头在握手时一次性使用，之后立即失效。
 async fn handle_ws_ticket(
@@ -586,7 +588,7 @@ async fn handle_ws_ticket(
     response
 }
 
-/// 撤销指定配对的所有浏览器会话（`POST /pair/:pairing_id/revoke`）。
+/// 撤销指定配对的所有浏览器会话（`POST /api/pairing/{pairing_id}/revoke`）。
 ///
 /// 需要 PC 客户端的 gRPC Bearer 令牌认证；通过递增 epoch 使现有会话 cookie 全部失效。
 async fn handle_revoke(
@@ -665,10 +667,10 @@ async fn handle_revoke(
     response
 }
 
-/// 将 HTTP 连接升级为 WebSocket（`GET /ws/:id`）。
+/// 将 HTTP 连接升级为 WebSocket（`GET /ws/mobile/{id}`）。
 ///
-/// 根据是否存在 `Sec-WebSocket-Protocol` 票据头，分别走手机端配对通道或
-/// 遗留会话通道；升级后进入 [`handle_pairing_ws`] 消息循环。
+/// 浏览器需通过 `Sec-WebSocket-Protocol` 携带短效票据完成鉴权；升级后进入
+/// [`handle_pairing_ws`] 消息循环。
 async fn handle_ws_upgrade(
     Path(id): Path<String>,
     State(state): State<AppState>,

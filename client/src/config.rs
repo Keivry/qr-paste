@@ -155,7 +155,10 @@ impl ClientConfig {
             return Err("client.toml 中必须填写 grpc_auth_token。".to_string());
         }
         if self.grpc_auth_token.len() < 16 {
-            tracing::warn!("grpc_auth_token 长度不足 16 字符，建议使用高熵随机值以确保安全性。");
+            return Err(
+                "client.toml 中的 grpc_auth_token 长度不足 16 字符，请使用高熵随机值以确保安全性。"
+                    .to_string(),
+            );
         }
         if Uuid::parse_str(&self.pairing_id).is_err() {
             return Err("client.toml 中的 pairing_id 必须是合法 UUID。".to_string());
@@ -249,6 +252,7 @@ mod tests {
     use super::*;
 
     const TEST_PAIRING_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const VALID_GRPC_AUTH_TOKEN: &str = "shared-secret-xx";
 
     fn parse(toml: &str) -> ClientConfig {
         let raw: RawClientConfig = toml::from_str(toml).expect("parse failed");
@@ -283,7 +287,7 @@ mod tests {
         let cfg = parse(
             r#"
             server_host = "example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             "#,
         );
         assert_eq!(cfg.grpc_port, 50051);
@@ -302,7 +306,7 @@ mod tests {
         let cfg = parse(
             r#"
             server_host = "relay.example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             grpc_port = 9090
             pairing_id = "123e4567-e89b-12d3-a456-426614174000"
             auto_paste = false
@@ -315,7 +319,7 @@ mod tests {
             "#,
         );
         assert_eq!(cfg.server_host, "relay.example.com");
-        assert_eq!(cfg.grpc_auth_token, "shared-secret");
+        assert_eq!(cfg.grpc_auth_token, VALID_GRPC_AUTH_TOKEN);
         assert_eq!(cfg.grpc_port, 9090);
         assert_eq!(cfg.pairing_id, "123e4567-e89b-12d3-a456-426614174000");
         assert!(!cfg.auto_paste);
@@ -332,7 +336,7 @@ mod tests {
         let cfg = parse(
             r#"
             server_host = "relay.example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             pairing_id = "123e4567-e89b-12d3-a456-426614174000"
             enter_after_paste = true
             "#,
@@ -346,7 +350,7 @@ mod tests {
         let cfg = parse(
             r#"
             server_host = "relay.example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             pairing_id = "123e4567-e89b-12d3-a456-426614174000"
             enter_after_paste = true
             emulation_key_after_paste = "Tab"
@@ -361,7 +365,7 @@ mod tests {
         let cfg = parse(&format!(
             r#"
             server_host = ""
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             pairing_id = "{TEST_PAIRING_ID}"
             "#
         ));
@@ -389,11 +393,26 @@ mod tests {
     }
 
     #[test]
+    fn short_grpc_auth_token_rejected() {
+        let cfg = parse(&format!(
+            r#"
+            server_host = "relay.example.com"
+            grpc_auth_token = "short-token"
+            pairing_id = "{TEST_PAIRING_ID}"
+            "#
+        ));
+        let error = cfg
+            .validate()
+            .expect_err("short auth token should fail validation");
+        assert!(error.contains("grpc_auth_token"));
+    }
+
+    #[test]
     fn https_server_host_is_allowed() {
         let cfg = parse(&format!(
             r#"
             server_host = "https://cg.keivry.ren"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             pairing_id = "{TEST_PAIRING_ID}"
             "#
         ));
@@ -406,7 +425,7 @@ mod tests {
         let cfg = parse(
             r#"
             server_host = "https://cg.keivry.ren"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             grpc_port = 8443
             "#,
         );
@@ -418,7 +437,7 @@ mod tests {
         let cfg = parse(&format!(
             r#"
             server_host = "https://cg.keivry.ren/grpc"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             pairing_id = "{TEST_PAIRING_ID}"
             "#
         ));
@@ -433,7 +452,7 @@ mod tests {
         let cfg = parse(
             r#"
             server_host = "relay.example.com"
-            grpc_auth_token = "shared-secret"
+            grpc_auth_token = "shared-secret-xx"
             pairing_id = "invalid"
             "#,
         );

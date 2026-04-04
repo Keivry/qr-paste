@@ -65,6 +65,7 @@ impl ClientRelayService {
     }
 }
 
+/// `Subscribe` RPC 使用的服务端流包装类型，析构时会清理关联会话。
 pub struct SessionStream {
     inner: ReceiverStream<Result<ServerEvent, Status>>,
     store: SessionStore,
@@ -142,7 +143,7 @@ impl ClientRelay for ClientRelayService {
         let grpc_session_token = Uuid::new_v4().to_string();
         let pairing_id = Uuid::parse_str(&request.get_ref().pairing_id)
             .map_err(|_| Status::invalid_argument("pairing_id must be a valid UUID"))?;
-        let (url, _) = upsert_pairing(&self.pairing_store, &self.config, pairing_id)?;
+        let (url, _) = upsert_pairing(&self.pairing_store, &self.config, pairing_id, &token)?;
 
         let (tx, rx) = mpsc::channel(32);
 
@@ -213,7 +214,13 @@ fn cleanup_session_on_client_disconnect(
 
     let successor_token = session
         .pairing_id
-        .and_then(|pairing_id| latest_session_token(store, pairing_id));
+        .and_then(|pairing_id| latest_session_token(store, pairing_store, pairing_id));
+
+    if let Some(pairing_id) = session.pairing_id
+        && let Some(mut entry) = pairing_store.get_mut(&pairing_id)
+    {
+        entry.active_session_token = successor_token.clone();
+    }
 
     if let Some(successor_token) = successor_token {
         if let Some(mut successor) = store.get_mut(&successor_token)
@@ -243,15 +250,25 @@ fn cleanup_session_on_client_disconnect(
     }
 }
 
-fn latest_session_token(store: &SessionStore, pairing_id: Uuid) -> Option<String> {
-    store
-        .iter()
-        .filter_map(|session| {
-            (session.pairing_id == Some(pairing_id))
-                .then(|| (session.key().clone(), session.created_at))
+fn latest_session_token(
+    store: &SessionStore,
+    pairing_store: &PairingStore,
+    pairing_id: Uuid,
+) -> Option<String> {
+    pairing_store
+        .get(&pairing_id)
+        .and_then(|entry| entry.active_session_token.clone())
+        .filter(|token| store.contains_key(token))
+        .or_else(|| {
+            store
+                .iter()
+                .filter_map(|session| {
+                    (session.pairing_id == Some(pairing_id))
+                        .then(|| (session.key().clone(), session.created_at))
+                })
+                .max_by_key(|(_, created_at)| *created_at)
+                .map(|(token, _)| token)
         })
-        .max_by_key(|(_, created_at)| *created_at)
-        .map(|(token, _)| token)
 }
 
 /// 启动 gRPC 服务器并阻塞监听。
@@ -304,6 +321,7 @@ fn upsert_pairing(
     pairing_store: &PairingStore,
     config: &ServerConfig,
     pairing_id: Uuid,
+    session_token: &str,
 ) -> Result<(String, [u8; 32]), Status> {
     let now = std::time::Instant::now();
     let public_base_url = config.public_base_url.trim_end_matches('/');
@@ -313,6 +331,7 @@ fn upsert_pairing(
         entry.online = true;
         entry.last_seen = now;
         entry.expires_at = now + ttl;
+        entry.active_session_token = Some(session_token.to_string());
         entry.revision = entry.revision.saturating_add(1);
         let secret = entry.pairing_secret;
         let url = format!(
@@ -336,6 +355,7 @@ fn upsert_pairing(
             online: true,
             last_seen: now,
             expires_at: now + ttl,
+            active_session_token: Some(session_token.to_string()),
             active_mobile_ws: None,
             revision: 0,
         },
@@ -355,7 +375,7 @@ mod tests {
     fn test_config() -> ServerConfig {
         ServerConfig {
             public_base_url: "https://example.com".to_string(),
-            grpc_auth_token: "shared-secret".to_string(),
+            grpc_auth_token: "shared-secret-xx".to_string(),
             grpc_port: 50051,
             http_port: 8080,
             http_bind_host: std::net::IpAddr::from([127, 0, 0, 1]),
@@ -407,7 +427,7 @@ mod tests {
         )
         .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
-            auth_token: "shared-secret".to_string(),
+            auth_token: "shared-secret-xx".to_string(),
             pairing_id: String::new(),
         });
 
@@ -426,7 +446,7 @@ mod tests {
         let service = ClientRelayService::new(store.clone(), pairing_store, test_config())
             .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
-            auth_token: "shared-secret".to_string(),
+            auth_token: "shared-secret-xx".to_string(),
             pairing_id: TEST_PAIRING_ID.to_string(),
         });
 
@@ -466,7 +486,7 @@ mod tests {
         let service = ClientRelayService::new(store.clone(), pairing_store.clone(), test_config())
             .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
-            auth_token: "shared-secret".to_string(),
+            auth_token: "shared-secret-xx".to_string(),
             pairing_id: TEST_PAIRING_ID.to_string(),
         });
 
@@ -571,6 +591,7 @@ mod tests {
                 online: true,
                 last_seen: Instant::now() - Duration::from_secs(120),
                 expires_at: old_expires_at,
+                active_session_token: Some("token".to_string()),
                 active_mobile_ws: None,
                 revision: 3,
             },
@@ -601,6 +622,7 @@ mod tests {
         assert!(!entry.online);
         assert!(entry.expires_at >= before + Duration::from_secs(300));
         assert!(entry.expires_at <= after + Duration::from_secs(300));
+        assert_eq!(entry.active_session_token, None);
         assert!(entry.revision >= 4);
     }
 
@@ -619,6 +641,7 @@ mod tests {
                 online: true,
                 last_seen: Instant::now(),
                 expires_at: Instant::now() + Duration::from_secs(300),
+                active_session_token: Some("older".to_string()),
                 active_mobile_ws: None,
                 revision: 0,
             },
@@ -670,6 +693,7 @@ mod tests {
             .get(&pairing_id)
             .expect("pairing should remain online");
         assert!(entry.online);
+        assert_eq!(entry.active_session_token.as_deref(), Some("newer"));
         assert_eq!(
             mobile_control_rx.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)

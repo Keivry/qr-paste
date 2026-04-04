@@ -31,8 +31,13 @@ tonic = { version = "0.14", features = ["tls-webpki-roots"] }
 tonic-prost = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tray-icon = "0.22"
 uuid = { version = "1.23", features = ["v4"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+tray-icon = "0.22"
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tray-icon = { version = "0.22", default-features = false }
 
 [build-dependencies]
 tonic-prost-build = "0.14"

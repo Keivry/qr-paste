@@ -209,6 +209,8 @@ impl App {
             repaint_ctx.request_repaint();
         });
     }
+
+    fn set_notice(&mut self, notice: String) { self.paste_notice = Some((notice, Instant::now())); }
 }
 
 impl eframe::App for App {
@@ -239,6 +241,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
 
+        let mut queued_notice = None;
         if let Some(rx) = &self.grpc_rx {
             loop {
                 match rx.try_recv() {
@@ -291,7 +294,8 @@ impl eframe::App for App {
                             } else {
                                 prefix
                             };
-                            let _ = self.clipboard_job_tx.try_send(ClipboardJob {
+                            let dropped_notice = notice_content.clone();
+                            if let Err(e) = self.clipboard_job_tx.try_send(ClipboardJob {
                                 content,
                                 auto_paste: self.config.auto_paste,
                                 emulation_key_after_paste: self
@@ -303,7 +307,23 @@ impl eframe::App for App {
                                     .delete_clipboard_after_paste,
                                 paste_delay_ms: self.config.paste_delay_ms,
                                 notice_content,
-                            });
+                            }) {
+                                match e {
+                                    mpsc::TrySendError::Full(_) => {
+                                        tracing::warn!(
+                                            "剪贴板任务队列已满，本次内容丢弃：{dropped_notice}"
+                                        );
+                                        queued_notice = Some(format!(
+                                            "⚠ 任务队列已满，内容已丢弃：{dropped_notice}"
+                                        ));
+                                    }
+                                    mpsc::TrySendError::Disconnected(_) => {
+                                        tracing::error!(
+                                            "剪贴板工作线程已退出，内容丢弃：{dropped_notice}"
+                                        );
+                                    }
+                                }
+                            }
                         }
                         ClientEvent::Error { message } => {
                             self.connecting_target = None;
@@ -327,6 +347,9 @@ impl eframe::App for App {
                     }
                 }
             }
+        }
+        if let Some(notice) = queued_notice {
+            self.set_notice(notice);
         }
 
         while let Ok(ev) = self.tray_rx.try_recv() {
@@ -497,8 +520,12 @@ fn public_base_url_from_session_url(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
     let scheme = parsed.scheme();
     let host = parsed.host_str()?;
-    let default_port = parsed.port_or_known_default();
     let explicit_port = parsed.port();
+    let default_port = match scheme {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    };
     let authority = match (explicit_port, default_port) {
         (Some(port), Some(default)) if port != default => format!("{host}:{port}"),
         (Some(port), None) => format!("{host}:{port}"),

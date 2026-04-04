@@ -15,6 +15,7 @@ use {
 };
 
 #[derive(Clone)]
+/// 手机端 WebSocket 连接句柄，可向对应任务发送关闭控制命令。
 pub struct WsHandle {
     /// 本次 WebSocket 连接的唯一标识，用于区分同一配对的多次连接。
     pub connection_id: Uuid,
@@ -31,10 +32,12 @@ impl fmt::Debug for WsHandle {
 }
 
 #[derive(Debug, Clone)]
+/// 发送给 WebSocket 任务的控制命令。
 pub enum WsControl {
     Close { code: u16, reason: &'static str },
 }
 
+/// 一条 PC 客户端与服务端之间稳定配对关系的运行时状态。
 pub struct PairingEntry {
     /// 配对唯一标识（UUID v4），也是 [`PairingStore`] 的 key。
     pub pairing_id: Uuid,
@@ -49,6 +52,8 @@ pub struct PairingEntry {
     pub last_seen: Instant,
     /// 配对记录的过期时刻；离线且超过此时刻的记录会在清理任务中删除。
     pub expires_at: Instant,
+    /// 当前活跃 gRPC 会话的令牌，由 gRPC Subscribe 写入，避免每次在 SessionStore 中 O(n) 扫描。
+    pub active_session_token: Option<String>,
     /// 当前活跃的手机端 WebSocket 连接句柄；`None` 表示手机端未连接。
     pub active_mobile_ws: Option<WsHandle>,
     /// 乐观锁版本号，在删除/修改时用于检测并发竞争。
@@ -64,12 +69,14 @@ impl fmt::Debug for PairingEntry {
             .field("online", &self.online)
             .field("last_seen", &self.last_seen)
             .field("expires_at", &self.expires_at)
+            .field("active_session_token", &self.active_session_token)
             .field("active_mobile_ws", &self.active_mobile_ws)
             .field("revision", &self.revision)
             .finish()
     }
 }
 
+/// 浏览器在完成 bootstrap 后获得的 cookie 会话。
 pub struct BrowserSession {
     /// 32 字节随机会话标识，同时作为 [`BrowserSessionStore`] 的 key，通过 hex 编码存入 cookie。
     pub session_id: [u8; 32],
@@ -101,6 +108,7 @@ impl fmt::Debug for BrowserSession {
     }
 }
 
+/// WebSocket 升级鉴权使用的短效一次性票据。
 pub struct WsTicket {
     /// 关联的浏览器会话标识，与 [`BrowserSession::session_id`] 对应。
     pub browser_session_id: [u8; 32],
@@ -231,7 +239,7 @@ pub fn spawn_cleanup_task(
             tokio::select! {
                 _ = cancellation.cancelled() => break,
                 _ = interval.tick() => {
-                    cleanup_old_sessions(&session_store, config.token_expiry_secs);
+                    cleanup_old_sessions(&session_store, &pairing_store, config.token_expiry_secs);
                     cleanup_pairings(
                         &pairing_store,
                         &browser_session_store,
@@ -243,17 +251,40 @@ pub fn spawn_cleanup_task(
     })
 }
 
-fn cleanup_old_sessions(session_store: &SessionStore, token_expiry_secs: u64) {
+fn cleanup_old_sessions(
+    session_store: &SessionStore,
+    pairing_store: &PairingStore,
+    token_expiry_secs: u64,
+) {
     let now = Instant::now();
+    let mut removed_pairing_ids: Vec<Uuid> = Vec::new();
     session_store.retain(|_, session| {
         let reservation_active = session
             .upgrade_reserved_at
             .is_some_and(|reserved_at| now.duration_since(reserved_at).as_secs() <= 10);
-        session.ws_active
+        let keep = session.ws_active
             || session.client_tx.is_some()
             || reservation_active
-            || now.duration_since(session.created_at).as_secs() <= token_expiry_secs
+            || now.duration_since(session.created_at).as_secs() <= token_expiry_secs;
+        if !keep && let Some(pid) = session.pairing_id {
+            removed_pairing_ids.push(pid);
+        }
+        keep
     });
+
+    let removed_pairing_ids: std::collections::HashSet<Uuid> =
+        removed_pairing_ids.into_iter().collect();
+    for pairing_id in removed_pairing_ids {
+        if let Some(mut entry) = pairing_store.get_mut(&pairing_id) {
+            let token_still_alive = entry
+                .active_session_token
+                .as_ref()
+                .is_some_and(|t| session_store.contains_key(t.as_str()));
+            if !token_still_alive {
+                entry.active_session_token = None;
+            }
+        }
+    }
 }
 
 fn cleanup_pairings(
@@ -335,7 +366,7 @@ mod tests {
             },
         );
 
-        cleanup_old_sessions(&store, 300);
+        cleanup_old_sessions(&store, &new_pairing_store(), 300);
 
         assert!(store.contains_key("active"));
     }
@@ -360,7 +391,7 @@ mod tests {
             },
         );
 
-        cleanup_old_sessions(&store, 300);
+        cleanup_old_sessions(&store, &new_pairing_store(), 300);
 
         assert!(store.contains_key("grpc-active"));
     }
@@ -380,6 +411,7 @@ mod tests {
                 online: true,
                 last_seen: Instant::now() - Duration::from_secs(600),
                 expires_at: Instant::now() - Duration::from_secs(10),
+                active_session_token: None,
                 active_mobile_ws: None,
                 revision: 0,
             },

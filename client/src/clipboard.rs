@@ -9,6 +9,7 @@ pub enum ClipboardSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 剪贴板还原流程的稳定错误码枚举。
 pub enum ClipboardRestoreError {
     OpenFailed,
     SetFailed,
@@ -125,6 +126,7 @@ pub fn simulate_paste(delay_ms: u64) {
     }
 }
 
+/// 解析配置中的按键规格字符串，返回可选修饰键与主键。
 pub fn parse_key_spec(s: &str) -> Option<(Option<enigo::Key>, enigo::Key)> {
     use enigo::Key;
     let (modifier_str, key_str) = match s.split_once('+') {

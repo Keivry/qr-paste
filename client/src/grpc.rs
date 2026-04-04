@@ -32,6 +32,7 @@ const HEARTBEAT_RETRY_MAX_SECS: u64 = 60;
 const HEARTBEAT_UNHEALTHY_THRESHOLD: u32 = 5;
 
 #[derive(Debug, Clone)]
+/// 启动 gRPC 客户端连接时使用的参数集合。
 pub struct StartOptions {
     pub host: String,
     pub port: u16,
