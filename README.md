@@ -16,7 +16,7 @@
 4. 服务端通过 WebSocket 收到文本，经 gRPC 流转发至 PC 客户端
 5. PC 客户端将文本写入系统剪贴板，并可选择模拟 `Ctrl+V` 自动粘贴
 
-一次会话令牌扫码即失效（单次使用），有效期 5 分钟（可配置）。
+手机端需经三步鉴权：调用 `bootstrap` 验证配对 secret 并获取 HttpOnly `Secure` BrowserSession Cookie（30 天有效期），再调用 `ws-ticket` 获取 15 秒一次性票据，最后凭票据发起 WebSocket 连接（票据用后立即失效）。
 
 ## 组件
 
@@ -128,7 +128,7 @@ grpc_port = 443
 - **三步连接流程**：手机需先调用 `bootstrap`（secret 验证，发放 HttpOnly `Secure` BrowserSession Cookie）→ `status`（轮询 PC 在线状态）→ `ws-ticket`（获取 15 秒一次性票据）→ WebSocket 握手（通过 `Sec-WebSocket-Protocol` 传递 ticket）
 - **旧路由已删除**：`/s/{token}` 页面路由已从路由表中移除；`/ws/mobile/{id}` WebSocket 路由升级为 ticket 机制，不再接受旧的 session_token 直连
 - **Origin 校验**：bootstrap、status、ws-ticket 及 WebSocket 握手均强制校验 `Origin` 与 `public_base_url` 完全匹配；不匹配直接返回 403
-- **epoch 撤销**：PC 端可触发 `POST /revoke`（需 gRPC session token 鉴权，且 token 必须绑定到目标 pairing_id）使所有旧 BrowserSession/WsTicket 立即失效，现有 WS 在 1 秒内关闭
+- **epoch 撤销**：PC 端可触发 `POST /revoke`（需 gRPC session token 鉴权，且 token 必须绑定到目标 pairing_id）使所有旧 BrowserSession/WsTicket 立即失效，现有 WS 立即收到关闭控制帧
 
 ## 安全注意事项
 

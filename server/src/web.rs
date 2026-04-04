@@ -389,7 +389,7 @@ async fn handle_bootstrap(
     }
 
     let now = Instant::now();
-    let (session_id, epoch, online, notify_url) = {
+    let (session_id, epoch, online, notify_url, notify_session_token, notify_client_tx) = {
         let Some(mut entry) = state.pairing_store.get_mut(&pairing_id) else {
             constant_time_dummy_compare(&payload.pairing_secret);
             return error_json(StatusCode::NOT_FOUND, "pairing_not_found_or_invalid");
@@ -439,24 +439,47 @@ async fn handle_bootstrap(
         entry.expires_at = now + Duration::from_secs(state.config.pairing_ttl_secs);
         entry.revision = entry.revision.saturating_add(1);
 
+        let active_token = entry.active_session_token.clone();
+        let epoch = entry.epoch;
+        let online = entry.online;
+        let notify_url = format!(
+            "{}/m/{}#ps={}",
+            state.config.public_base_url.trim_end_matches('/'),
+            pairing_id,
+            encode_hex(&new_secret)
+        );
+        drop(entry);
+
+        let notify_session_token = active_token
+            .as_deref()
+            .filter(|t| state.store.contains_key(*t))
+            .map(ToOwned::to_owned)
+            .or_else(|| latest_session_token(&state.store, &state.pairing_store, pairing_id))
+            .unwrap_or_default();
+        let notify_client_tx = if notify_session_token.is_empty() {
+            None
+        } else {
+            state
+                .store
+                .get(&notify_session_token)
+                .and_then(|s| s.client_tx.clone())
+        };
+
         (
             session_id,
-            entry.epoch,
-            entry.online,
-            format!(
-                "{}/m/{}#ps={}",
-                state.config.public_base_url.trim_end_matches('/'),
-                pairing_id,
-                encode_hex(&new_secret)
-            ),
+            epoch,
+            online,
+            notify_url,
+            notify_session_token,
+            notify_client_tx,
         )
     };
 
-    if let Some(client_tx) = current_client_tx(&state.store, pairing_id) {
+    if let Some(client_tx) = notify_client_tx {
         let _ = client_tx
             .send(Ok(ServerEvent {
                 event: Some(Event::SessionToken(SessionToken {
-                    token: current_session_token(&state.store, pairing_id).unwrap_or_default(),
+                    token: notify_session_token,
                     url: notify_url,
                 })),
                 grpc_session_token: String::new(),
@@ -704,7 +727,10 @@ async fn handle_ws_upgrade(
         else {
             return unauthorized_ws_response();
         };
-        if browser_session.revoked || browser_session.pairing_id != pairing_id {
+        if browser_session.revoked
+            || browser_session.expires_at <= now
+            || browser_session.pairing_id != pairing_id
+        {
             return unauthorized_ws_response();
         }
         let browser_session_id = browser_session.session_id;
@@ -782,8 +808,13 @@ async fn handle_pairing_ws(
     }
 
     let (mut sender, mut receiver) = socket.split();
-    let session_token = mark_mobile_ws_connected(&state.store, pairing_id, &mobile_control_tx);
-    if let Some(client_tx) = current_client_tx(&state.store, pairing_id) {
+    let session_token = mark_mobile_ws_connected(
+        &state.store,
+        &state.pairing_store,
+        pairing_id,
+        &mobile_control_tx,
+    );
+    if let Some(client_tx) = current_client_tx(&state.store, &state.pairing_store, pairing_id) {
         let _ = client_tx
             .send(Ok(ServerEvent {
                 event: Some(Event::MobileConnected(MobileConnected {
@@ -884,7 +915,9 @@ async fn handle_pairing_ws(
                         if content.is_empty() {
                             continue;
                         }
-                        let Some(client_tx) = current_client_tx(&state.store, pairing_id) else {
+                        let Some(client_tx) =
+                            current_client_tx(&state.store, &state.pairing_store, pairing_id)
+                        else {
                             let message = serialize_mobile_message(&ServerToMobileMessage::ClientDisconnected);
                             let _ = sender.send(Message::Text(message.into())).await;
                             break;
@@ -915,7 +948,7 @@ async fn handle_pairing_ws(
         entry.revision = entry.revision.saturating_add(1);
     }
 
-    if let Some(client_tx) = current_client_tx(&state.store, pairing_id) {
+    if let Some(client_tx) = current_client_tx(&state.store, &state.pairing_store, pairing_id) {
         let _ = client_tx
             .send(Ok(ServerEvent {
                 event: Some(Event::MobileDisconnected(MobileDisconnected {})),
@@ -941,6 +974,9 @@ fn validate_pairing_ws(
     }
     let session = state.browser_session_store.get(&browser_session_id)?;
     if session.revoked {
+        return Some(4003);
+    }
+    if session.expires_at <= Instant::now() {
         return Some(4003);
     }
     if session.pairing_epoch != entry.epoch {
@@ -1004,6 +1040,10 @@ fn require_browser_origin(state: &AppState, headers: &HeaderMap) -> Result<(), S
     Ok(())
 }
 
+/// 从 `Sec-WebSocket-Protocol` 头解析一次性 WS 票据。
+///
+/// 头部应包含两个以逗号分隔的子协议值：`v1` 和 `ticket.<base64url>` 。
+/// 成功时返回 32 字节原始票据，格式或长度不符时返回 `400 Bad Request`。
 fn parse_ws_protocol_ticket(header: &HeaderValue) -> Result<[u8; 32], StatusCode> {
     let Ok(value) = header.to_str() else {
         return Err(StatusCode::BAD_REQUEST);
@@ -1039,35 +1079,47 @@ fn parse_ws_protocol_ticket(header: &HeaderValue) -> Result<[u8; 32], StatusCode
 
 fn current_client_tx(
     store: &SessionStore,
+    pairing_store: &PairingStore,
     pairing_id: Uuid,
 ) -> Option<mpsc::Sender<Result<ServerEvent, tonic::Status>>> {
-    let token = latest_session_token(store, pairing_id)?;
+    let token = latest_session_token(store, pairing_store, pairing_id)?;
     store
         .get(&token)
         .and_then(|session| session.client_tx.clone())
 }
 
-fn current_session_token(store: &SessionStore, pairing_id: Uuid) -> Option<String> {
-    latest_session_token(store, pairing_id)
-}
-
-fn latest_session_token(store: &SessionStore, pairing_id: Uuid) -> Option<String> {
-    store
-        .iter()
-        .filter_map(|session| {
-            (session.pairing_id == Some(pairing_id))
-                .then(|| (session.key().clone(), session.created_at))
+/// 返回指定配对的最新活跃 gRPC 会话令牌。
+///
+/// 优先从 [`PairingEntry::active_session_token`] 直接取值（O(1)），若该令牌已从
+/// [`SessionStore`] 中清除则回退到全表扫描，保证兼容旧会话缺失索引的情况。
+fn latest_session_token(
+    store: &SessionStore,
+    pairing_store: &PairingStore,
+    pairing_id: Uuid,
+) -> Option<String> {
+    pairing_store
+        .get(&pairing_id)
+        .and_then(|entry| entry.active_session_token.clone())
+        .filter(|token| store.contains_key(token.as_str()))
+        .or_else(|| {
+            store
+                .iter()
+                .filter_map(|session| {
+                    (session.pairing_id == Some(pairing_id))
+                        .then(|| (session.key().clone(), session.created_at))
+                })
+                .max_by_key(|(_, created_at)| *created_at)
+                .map(|(token, _)| token)
         })
-        .max_by_key(|(_, created_at)| *created_at)
-        .map(|(token, _)| token)
 }
 
 fn mark_mobile_ws_connected(
     store: &SessionStore,
+    pairing_store: &PairingStore,
     pairing_id: Uuid,
     mobile_control_tx: &mpsc::UnboundedSender<String>,
 ) -> Option<String> {
-    let token = latest_session_token(store, pairing_id)?;
+    let token = latest_session_token(store, pairing_store, pairing_id)?;
     if let Some(mut session) = store.get_mut(&token) {
         session.ws_active = true;
         session.mobile_control_tx = Some(mobile_control_tx.clone());
@@ -1104,6 +1156,9 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// 通过恒定时间比较将 Bearer 令牌映射到对应的 `SessionStore` 键。
+///
+/// 用于防止基于时序的令牌枚举攻击（与 `authenticate_browser_session` 中的做法一致）。
 fn grpc_session_token(store: &SessionStore, bearer_token: &str) -> Option<String> {
     let token_bytes = bearer_token.as_bytes();
     store.iter().find_map(|session| {
@@ -1204,7 +1259,10 @@ fn serialize_mobile_message(message: &ServerToMobileMessage) -> String {
 mod tests {
     use {
         super::*,
-        crate::session::{Session, new_store},
+        crate::{
+            pairing::new_pairing_store,
+            session::{Session, new_store},
+        },
         tokio::sync::mpsc,
     };
 
@@ -1298,6 +1356,7 @@ mod tests {
     #[test]
     fn mark_mobile_ws_connected_updates_latest_session() {
         let store = new_store();
+        let pairing_store = new_pairing_store();
         let pairing_id = Uuid::new_v4();
         store.insert(
             "older".to_string(),
@@ -1313,7 +1372,8 @@ mod tests {
         );
         let (mobile_control_tx, _mobile_control_rx) = mpsc::unbounded_channel();
 
-        let session_token = mark_mobile_ws_connected(&store, pairing_id, &mobile_control_tx);
+        let session_token =
+            mark_mobile_ws_connected(&store, &pairing_store, pairing_id, &mobile_control_tx);
 
         assert_eq!(session_token.as_deref(), Some("newer"));
         assert!(
