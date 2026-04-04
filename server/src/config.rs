@@ -4,7 +4,7 @@ use {
     ipnet::IpNet,
     serde::Deserialize,
     std::{fmt, fs, net::IpAddr, sync::Arc},
-    url::Url,
+    url::{Host, Url},
 };
 
 #[derive(Clone)]
@@ -288,19 +288,60 @@ fn validate_public_base_url(public_base_url: &str) -> anyhow::Result<()> {
         anyhow::bail!("public_base_url 不能包含非根路径");
     }
 
+    let host = url.host_str().unwrap_or("");
+    let is_loopback = match url.host() {
+        Some(Host::Ipv4(v4)) => v4.is_loopback(),
+        Some(Host::Ipv6(v6)) => v6.is_loopback(),
+        Some(Host::Domain(name)) => matches!(name, "localhost"),
+        None => false,
+    };
+    let is_non_public = match url.host() {
+        Some(Host::Ipv4(v4)) => is_non_public_ip(IpAddr::V4(v4)),
+        Some(Host::Ipv6(v6)) => is_non_public_ip(IpAddr::V6(v6)),
+        Some(Host::Domain(name)) => matches!(name, "localhost"),
+        None => false,
+    };
+
     if url.scheme() == "http" {
-        let host = url.host_str().unwrap_or("");
-        let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
         if !is_loopback {
             anyhow::bail!(
                 "public_base_url 必须使用 https:// 协议（生产环境）；\
                  检测到非 loopback 地址的 http:// 配置"
             );
         }
+    } else if url.scheme() == "https" && is_non_public {
+        anyhow::bail!(
+            "public_base_url 不能设为内网/loopback 地址（检测到 {host}）；\
+             请配置手机可访问的公网地址"
+        );
     }
 
     let _ = normalize_origin(public_base_url)?;
     Ok(())
+}
+
+fn is_non_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            // Unique Local Address (ULA): fc00::/7 — stable API 暂无，手动检测
+            let first_octet = v6.octets()[0];
+            if first_octet & 0xfe == 0xfc {
+                return true;
+            }
+            // Link-local unicast: fe80::/10
+            let first_two = u16::from_be_bytes([v6.octets()[0], v6.octets()[1]]);
+            if first_two & 0xffc0 == 0xfe80 {
+                return true;
+            }
+            false
+        }
+    }
 }
 
 fn normalize_origin(value: &str) -> anyhow::Result<String> {
@@ -550,5 +591,54 @@ mod tests {
             "#,
         );
         cfg.validate().expect("http://localhost should be allowed");
+    }
+
+    #[test]
+    fn http_ipv6_loopback_allowed_at_validation() {
+        let toml = "public_base_url = \"http://[::1]:8080\"\ngrpc_auth_token = \"shared-secret\"";
+        let cfg = parse(toml);
+        cfg.validate()
+            .expect("http://[::1] should be allowed for local dev");
+    }
+
+    #[test]
+    fn https_loopback_rejected_at_validation() {
+        for url in &["https://127.0.0.1", "https://localhost", "https://[::1]"] {
+            let toml = format!("public_base_url = \"{url}\"\ngrpc_auth_token = \"shared-secret\"");
+            let cfg = parse(&toml);
+            cfg.validate()
+                .expect_err(&format!("https loopback {url} should be rejected"));
+        }
+    }
+
+    #[test]
+    fn https_private_rejected_at_validation() {
+        for url in &[
+            "https://10.0.0.1",
+            "https://192.168.1.1",
+            "https://172.16.0.1",
+            "https://172.31.255.255",
+            "https://169.254.1.1",
+        ] {
+            let toml = format!("public_base_url = \"{url}\"\ngrpc_auth_token = \"shared-secret\"");
+            let cfg = parse(&toml);
+            cfg.validate()
+                .expect_err(&format!("https private {url} should be rejected"));
+        }
+    }
+
+    #[test]
+    fn https_ipv6_non_public_rejected_at_validation() {
+        for url in &[
+            "https://[fd00::1]",
+            "https://[fc00::1]",
+            "https://[fe80::1]",
+            "https://[febf::1]",
+        ] {
+            let toml = format!("public_base_url = \"{url}\"\ngrpc_auth_token = \"shared-secret\"");
+            let cfg = parse(&toml);
+            cfg.validate()
+                .expect_err(&format!("https IPv6 non-public {url} should be rejected"));
+        }
     }
 }

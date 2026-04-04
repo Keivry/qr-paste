@@ -197,10 +197,14 @@ where
         revoke_session_limiter: keyed_limiter(10),
     };
 
+    let http_rate = config.http_rate_limit_per_ip_per_min;
+    let ws_rate = config.ws_rate_limit_per_ip_per_min;
+    let bootstrap_rate = (http_rate / 4).max(1);
+
     let http_limit = Arc::new(
         GovernorConfigBuilder::default()
             .period(Duration::from_secs(60))
-            .burst_size(20)
+            .burst_size(http_rate)
             .methods(vec![Method::GET])
             .key_extractor(key_extractor.clone())
             .finish()
@@ -209,7 +213,7 @@ where
     let bootstrap_limit = Arc::new(
         GovernorConfigBuilder::default()
             .period(Duration::from_secs(60))
-            .burst_size(5)
+            .burst_size(bootstrap_rate)
             .methods(vec![Method::POST])
             .key_extractor(key_extractor.clone())
             .finish()
@@ -218,7 +222,7 @@ where
     let status_limit = Arc::new(
         GovernorConfigBuilder::default()
             .period(Duration::from_secs(60))
-            .burst_size(10)
+            .burst_size(ws_rate)
             .methods(vec![Method::POST])
             .key_extractor(key_extractor.clone())
             .finish()
@@ -227,7 +231,7 @@ where
     let ws_ticket_limit = Arc::new(
         GovernorConfigBuilder::default()
             .period(Duration::from_secs(60))
-            .burst_size(10)
+            .burst_size(ws_rate)
             .methods(vec![Method::POST])
             .key_extractor(key_extractor.clone())
             .finish()
@@ -236,7 +240,7 @@ where
     let revoke_limit = Arc::new(
         GovernorConfigBuilder::default()
             .period(Duration::from_secs(60))
-            .burst_size(20)
+            .burst_size(http_rate)
             .methods(vec![Method::POST])
             .key_extractor(key_extractor.clone())
             .finish()
@@ -245,7 +249,7 @@ where
     let ws_limit = Arc::new(
         GovernorConfigBuilder::default()
             .period(Duration::from_secs(60))
-            .burst_size(10)
+            .burst_size(ws_rate)
             .methods(vec![Method::GET])
             .key_extractor(key_extractor)
             .finish()
@@ -476,7 +480,7 @@ async fn handle_bootstrap(
 
 /// 返回当前配对及 PC 客户端的在线状态（`POST /pair/:pairing_id/status`）。
 ///
-/// 需要有效的浏览器会话 cookie；PC 不在线时响应中包含轮询建议间隔。
+/// 需要有效的浏览器会话 cookie；PC 不在线时响应固定包含 `retry_after_ms: 1000`。
 async fn handle_status(
     Path(pairing_id): Path<String>,
     State(state): State<AppState>,

@@ -7,7 +7,7 @@ use {
     dashmap::DashMap,
     rand::RngExt,
     regex::Regex,
-    std::{fmt, sync::Arc, time::Instant},
+    std::{collections::HashSet, fmt, sync::Arc, time::Instant},
     subtle::ConstantTimeEq,
     tokio::{sync::mpsc, task::JoinHandle, time::Duration},
     tokio_util::sync::CancellationToken,
@@ -16,7 +16,9 @@ use {
 
 #[derive(Clone)]
 pub struct WsHandle {
+    /// 本次 WebSocket 连接的唯一标识，用于区分同一配对的多次连接。
     pub connection_id: Uuid,
+    /// 向 WebSocket 任务发送控制指令（如关闭）的无界通道发送端。
     pub control_tx: mpsc::UnboundedSender<WsControl>,
 }
 
@@ -34,13 +36,22 @@ pub enum WsControl {
 }
 
 pub struct PairingEntry {
+    /// 配对唯一标识（UUID v4），也是 [`PairingStore`] 的 key。
     pub pairing_id: Uuid,
+    /// 用于验证手机端身份的 32 字节随机密钥，通过 hex 编码后嵌入二维码 URL。
     pub pairing_secret: [u8; 32],
+    /// 撤销纪元，每次 `POST /revoke` 后递增；手机端 BrowserSession/WsTicket 中记录的
+    /// 旧纪元值会立即失效。
     pub epoch: u64,
+    /// PC 客户端当前是否在线（持有活跃的 gRPC Subscribe 流）。
     pub online: bool,
+    /// PC 客户端最近一次心跳或连接时刻，用于诊断和 TTL 续期。
     pub last_seen: Instant,
+    /// 配对记录的过期时刻；离线且超过此时刻的记录会在清理任务中删除。
     pub expires_at: Instant,
+    /// 当前活跃的手机端 WebSocket 连接句柄；`None` 表示手机端未连接。
     pub active_mobile_ws: Option<WsHandle>,
+    /// 乐观锁版本号，在删除/修改时用于检测并发竞争。
     pub revision: u64,
 }
 
@@ -60,12 +71,19 @@ impl fmt::Debug for PairingEntry {
 }
 
 pub struct BrowserSession {
+    /// 32 字节随机会话标识，同时作为 [`BrowserSessionStore`] 的 key，通过 hex 编码存入 cookie。
     pub session_id: [u8; 32],
+    /// 所属配对的唯一标识。
     pub pairing_id: Uuid,
+    /// 创建时记录的配对纪元；纪元不匹配时视为已撤销。
     pub pairing_epoch: u64,
+    /// 会话创建时刻。
     pub created_at: Instant,
+    /// 最近一次请求时刻，用于诊断。
     pub last_seen: Instant,
+    /// 会话过期时刻；超过后在清理任务中删除。
     pub expires_at: Instant,
+    /// 是否已通过 `/revoke` 主动撤销。
     pub revoked: bool,
 }
 
@@ -84,10 +102,15 @@ impl fmt::Debug for BrowserSession {
 }
 
 pub struct WsTicket {
+    /// 关联的浏览器会话标识，与 [`BrowserSession::session_id`] 对应。
     pub browser_session_id: [u8; 32],
+    /// 所属配对的唯一标识。
     pub pairing_id: Uuid,
+    /// 签发时记录的配对纪元；纪元不匹配时票据立即失效。
     pub pairing_epoch: u64,
+    /// 票据签发时刻。
     pub issued_at: Instant,
+    /// 票据过期时刻（通常为签发后 15 秒）。
     pub expires_at: Instant,
 }
 
@@ -239,7 +262,7 @@ fn cleanup_pairings(
     ws_ticket_store: &WsTicketStore,
 ) {
     let now = Instant::now();
-    let mut removed_pairings = Vec::new();
+    let mut removed_pairings = HashSet::new();
 
     let observed: Vec<(Uuid, u64)> = pairing_store
         .iter()
@@ -259,7 +282,7 @@ fn cleanup_pairings(
             })
             .is_some()
         {
-            removed_pairings.push(pairing_id);
+            removed_pairings.insert(pairing_id);
         }
     }
 

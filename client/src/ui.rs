@@ -67,7 +67,7 @@ pub struct App {
     /// gRPC 事件接收端；gRPC 线程退出后置为 `None`。
     grpc_rx: Option<mpsc::Receiver<ClientEvent>>,
     tray_rx: mpsc::Receiver<tray::TrayEvent>,
-    clipboard_job_tx: mpsc::Sender<ClipboardJob>,
+    clipboard_job_tx: mpsc::SyncSender<ClipboardJob>,
     clipboard_notice_rx: mpsc::Receiver<String>,
     paste_notice: Option<(String, Instant)>,
     last_session_token: Option<String>,
@@ -107,7 +107,7 @@ impl App {
         };
 
         let (clipboard_notice_tx, clipboard_notice_rx) = mpsc::channel();
-        let (clipboard_job_tx, clipboard_job_rx) = mpsc::channel();
+        let (clipboard_job_tx, clipboard_job_rx) = mpsc::sync_channel(64);
         start_clipboard_worker(
             clipboard_job_rx,
             clipboard_notice_tx.clone(),
@@ -291,7 +291,7 @@ impl eframe::App for App {
                             } else {
                                 prefix
                             };
-                            let _ = self.clipboard_job_tx.send(ClipboardJob {
+                            let _ = self.clipboard_job_tx.try_send(ClipboardJob {
                                 content,
                                 auto_paste: self.config.auto_paste,
                                 emulation_key_after_paste: self

@@ -12,6 +12,7 @@ use {
         session::{Session, SessionStore},
     },
     common::ServerToMobileMessage,
+    dashmap::DashMap,
     futures::Stream,
     relay::{
         PingRequest,
@@ -23,6 +24,7 @@ use {
     },
     std::{
         net::SocketAddr,
+        sync::Arc,
         time::{Duration, Instant},
     },
     subtle::ConstantTimeEq,
@@ -42,6 +44,7 @@ pub struct ClientRelayService {
     pairing_store: PairingStore,
     config: ServerConfig,
     trusted_proxies: TrustedProxyCidrs,
+    grpc_tokens: Arc<DashMap<String, ()>>,
 }
 
 impl ClientRelayService {
@@ -57,6 +60,7 @@ impl ClientRelayService {
             pairing_store,
             config,
             trusted_proxies,
+            grpc_tokens: Arc::new(DashMap::new()),
         })
     }
 }
@@ -67,6 +71,8 @@ pub struct SessionStream {
     pairing_store: PairingStore,
     pairing_ttl_secs: u64,
     token: String,
+    grpc_session_token: String,
+    grpc_tokens: Arc<DashMap<String, ()>>,
 }
 
 impl std::fmt::Debug for SessionStream {
@@ -90,6 +96,7 @@ impl Stream for SessionStream {
 
 impl Drop for SessionStream {
     fn drop(&mut self) {
+        self.grpc_tokens.remove(&self.grpc_session_token);
         cleanup_session_on_client_disconnect(
             &self.store,
             &self.pairing_store,
@@ -167,12 +174,16 @@ impl ClientRelay for ClientRelayService {
             .await
             .map_err(|_| Status::internal("channel send failed"))?;
 
+        self.grpc_tokens.insert(grpc_session_token.clone(), ());
+
         let stream = SessionStream {
             inner: ReceiverStream::new(rx),
             store: self.store.clone(),
             pairing_store: self.pairing_store.clone(),
             pairing_ttl_secs: self.config.pairing_ttl_secs,
             token,
+            grpc_session_token,
+            grpc_tokens: Arc::clone(&self.grpc_tokens),
         };
 
         Ok(Response::new(stream))
@@ -183,12 +194,7 @@ impl ClientRelay for ClientRelayService {
         if token.is_empty() {
             return Err(Status::unauthenticated("missing grpc_session_token"));
         }
-        let token_bytes = token.as_bytes();
-        let valid = self.store.iter().any(|session| {
-            let stored = session.grpc_session_token.as_bytes();
-            stored.len() == token_bytes.len() && stored.ct_eq(token_bytes).into()
-        });
-        if !valid {
+        if !self.grpc_tokens.contains_key(&token) {
             return Err(Status::unauthenticated("invalid grpc_session_token"));
         }
         Ok(Response::new(PingResponse {}))
