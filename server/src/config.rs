@@ -74,7 +74,6 @@ impl TrustedProxyCidrs {
 /// 所有字段均有默认值（`public_base_url` 和 `grpc_auth_token` 除外）。
 /// 参考 `server.example.toml` 查看每个字段的详细说明。
 #[derive(Clone, Deserialize)]
-#[allow(dead_code)]
 pub struct ServerConfig {
     /// 【必填】服务端对外可访问的基础 URL，不含尾部斜线。
     /// 例如 `"https://example.com"`，用于拼接二维码链接。

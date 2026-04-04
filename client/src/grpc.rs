@@ -45,36 +45,25 @@ pub struct StartOptions {
 #[derive(Debug)]
 pub enum ClientEvent {
     /// 本轮连接尝试的目标地址（格式为「正在连接 <address> ...」）。
-    ConnectingTarget {
-        message: String,
-    },
+    ConnectingTarget { message: String },
     /// 当前连接阶段性进度描述。
-    ConnectingStatus {
-        message: String,
-    },
+    ConnectingStatus { message: String },
     /// 服务端分配了新的会话令牌和对应的手机扫码 URL。
     SessionToken {
         #[allow(dead_code)]
         token: String,
         url: String,
     },
-    GrpcSessionToken {
-        token: String,
-    },
+    /// 服务端分配了内部 gRPC 会话令牌，用于鉴权后续请求（如 `revoke`）。
+    GrpcSessionToken { token: String },
     /// 手机端已通过 WebSocket 连接到服务端并与本次会话绑定。
-    MobileConnected {
-        device_info: String,
-    },
+    MobileConnected { device_info: String },
     /// 手机端 WebSocket 连接已断开。
     MobileDisconnected,
     /// 手机端发送了剪贴板文本内容。
-    ClipboardText {
-        content: String,
-    },
+    ClipboardText { content: String },
     /// gRPC 连接发生不可恢复的错误。
-    Error {
-        message: String,
-    },
+    Error { message: String },
 }
 
 /// 在独立线程中启动 gRPC 客户端，进行单次连接尝试，将接收到的事件发送至 `tx`。
