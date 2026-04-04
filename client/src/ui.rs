@@ -162,7 +162,10 @@ impl App {
     fn revoke_endpoint_url(&self) -> Option<String> {
         let base = self.last_public_base_url.as_deref()?.trim_end_matches('/');
         if base.starts_with("http://") || base.starts_with("https://") {
-            Some(format!("{base}/api/pairing/{}/revoke", self.config.pairing_id))
+            Some(format!(
+                "{base}/api/pairing/{}/revoke",
+                self.config.pairing_id
+            ))
         } else {
             Some(format!(
                 "http://{base}/api/pairing/{}/revoke",

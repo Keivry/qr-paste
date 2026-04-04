@@ -470,9 +470,7 @@ async fn handle_bootstrap(
     )) else {
         return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
     };
-    response
-        .headers_mut()
-        .append(SET_COOKIE, cookie_value);
+    response.headers_mut().append(SET_COOKIE, cookie_value);
     response
 }
 

@@ -27,11 +27,11 @@ impl Drop for Tray {
 /// 返回的 [`Tray`] 必须在应用生命周期内保持存活；drop 后托盘和菜单事件将停止响应。
 pub fn start(tx: mpsc::Sender<TrayEvent>, repaint_ctx: egui::Context) -> Result<Tray, String> {
     use tray_icon::{
-        menu::{Menu, MenuEvent, MenuItem},
         MouseButton,
         MouseButtonState,
         TrayIconBuilder,
         TrayIconEvent,
+        menu::{Menu, MenuEvent, MenuItem},
     };
 
     let menu = Menu::new();
