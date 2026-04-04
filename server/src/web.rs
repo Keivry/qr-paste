@@ -25,7 +25,7 @@ use {
             random_bytes_32,
             verify_secret,
         },
-        session::SessionStore,
+        session::{SessionStore, latest_session_token},
     },
     axum::{
         Json,
@@ -106,16 +106,28 @@ static MOBILE_HTML: &str = include_str!("web/index.html");
 #[derive(Clone)]
 /// 注入到全部 HTTP 处理器中的共享服务端状态。
 pub struct AppState {
+    /// gRPC 会话存储，保存每次 PC 客户端 Subscribe 调用的会话状态。
     pub store: SessionStore,
+    /// 配对存储，保存每个稳定配对关系的运行时状态（在线状态、活跃会话令牌等）。
     pub pairing_store: PairingStore,
+    /// 浏览器会话存储，保存手机端通过 bootstrap 获得的 HttpOnly Cookie 会话。
     pub browser_session_store: BrowserSessionStore,
+    /// WebSocket 票据存储，保存 ws-ticket 接口签发的短效一次性票据。
     pub ws_ticket_store: WsTicketStore,
+    /// 服务端配置（不可变，Arc 共享）。
     pub config: Arc<ServerConfig>,
+    /// 预计算的公开 Origin 字符串（如 `https://relay.example.com`），用于校验 HTTP `Origin` 请求头。
     pub public_origin: Arc<String>,
+    /// WebSocket 全局并发连接数信号量，上限由 `config.max_ws_connections` 决定。
     pub ws_slots: Arc<Semaphore>,
+    /// `/status` 接口按浏览器会话 ID 的限流器，防止状态轮询过于频繁。
     pub status_limiter: KeyedLimiter<[u8; 32]>,
+    /// `/ws-ticket` 接口按浏览器会话 ID 的限流器，防止票据签发被滥用。
     pub ws_ticket_limiter: KeyedLimiter<[u8; 32]>,
+    /// `POST /revoke` 接口按 pairing_id 的限流器，防止撤销接口被暴力调用。
     pub revoke_pairing_limiter: KeyedLimiter<Uuid>,
+    /// `POST /api/pairing/{pairing_id}/revoke` 撤销路由中按 gRPC session token 维度的限流器，
+    /// 防止同一 token 的撤销请求被暴力重试。
     pub revoke_session_limiter: KeyedLimiter<String>,
 }
 
@@ -1086,31 +1098,6 @@ fn current_client_tx(
     store
         .get(&token)
         .and_then(|session| session.client_tx.clone())
-}
-
-/// 返回指定配对的最新活跃 gRPC 会话令牌。
-///
-/// 优先从 [`PairingEntry::active_session_token`] 直接取值（O(1)），若该令牌已从
-/// [`SessionStore`] 中清除则回退到全表扫描，保证兼容旧会话缺失索引的情况。
-fn latest_session_token(
-    store: &SessionStore,
-    pairing_store: &PairingStore,
-    pairing_id: Uuid,
-) -> Option<String> {
-    pairing_store
-        .get(&pairing_id)
-        .and_then(|entry| entry.active_session_token.clone())
-        .filter(|token| store.contains_key(token.as_str()))
-        .or_else(|| {
-            store
-                .iter()
-                .filter_map(|session| {
-                    (session.pairing_id == Some(pairing_id))
-                        .then(|| (session.key().clone(), session.created_at))
-                })
-                .max_by_key(|(_, created_at)| *created_at)
-                .map(|(token, _)| token)
-        })
 }
 
 fn mark_mobile_ws_connected(

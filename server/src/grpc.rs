@@ -9,7 +9,7 @@ use {
     crate::{
         config::{ServerConfig, TrustedProxyCidrs},
         pairing::{PairingEntry, PairingStore, encode_hex, random_bytes_32},
-        session::{Session, SessionStore},
+        session::{Session, SessionStore, latest_session_token},
     },
     common::ServerToMobileMessage,
     dashmap::DashMap,
@@ -248,27 +248,6 @@ fn cleanup_session_on_client_disconnect(
     if let Some(control_tx) = session.mobile_control_tx {
         let _ = control_tx.send(message);
     }
-}
-
-fn latest_session_token(
-    store: &SessionStore,
-    pairing_store: &PairingStore,
-    pairing_id: Uuid,
-) -> Option<String> {
-    pairing_store
-        .get(&pairing_id)
-        .and_then(|entry| entry.active_session_token.clone())
-        .filter(|token| store.contains_key(token))
-        .or_else(|| {
-            store
-                .iter()
-                .filter_map(|session| {
-                    (session.pairing_id == Some(pairing_id))
-                        .then(|| (session.key().clone(), session.created_at))
-                })
-                .max_by_key(|(_, created_at)| *created_at)
-                .map(|(token, _)| token)
-        })
 }
 
 /// 启动 gRPC 服务器并阻塞监听。

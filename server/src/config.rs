@@ -275,7 +275,7 @@ fn validate_public_base_url(public_base_url: &str) -> anyhow::Result<()> {
     let url = Url::parse(public_base_url)
         .map_err(|err| anyhow::anyhow!("public_base_url 不是合法 URL：{err}"))?;
 
-    if url.username() != "" || url.password().is_some() {
+    if !url.username().is_empty() || url.password().is_some() {
         anyhow::bail!("public_base_url 不能包含 userinfo");
     }
     if url.query().is_some() {
@@ -284,7 +284,7 @@ fn validate_public_base_url(public_base_url: &str) -> anyhow::Result<()> {
     if url.fragment().is_some() {
         anyhow::bail!("public_base_url 不能包含 fragment");
     }
-    if url.path() != "" && url.path() != "/" {
+    if !url.path().is_empty() && url.path() != "/" {
         anyhow::bail!("public_base_url 不能包含非根路径");
     }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use {
-    crate::grpc::relay::ServerEvent,
+    crate::{grpc::relay::ServerEvent, pairing::PairingStore},
     dashmap::DashMap,
     std::{sync::Arc, time::Instant},
     tokio::sync::mpsc,
@@ -14,6 +14,9 @@ use {
 /// 手机扫码后通过 WebSocket 与该 Session 绑定的 PC 客户端通信。
 pub struct Session {
     /// 会话令牌（UUID v4 字符串），同时也是 SessionStore 的 key。
+    ///
+    /// 虽然当前多数路径直接使用 DashMap 的 key，但仍保留该字段以便会话对象自描述，避免在日志、
+    /// 调试或后续序列化场景中必须额外传入外层 key。
     #[allow(dead_code)]
     pub token: String,
     /// 会话创建时刻，用于计算是否超过 `token_expiry_secs`。
@@ -37,6 +40,9 @@ pub struct Session {
     /// 目前用于在 PC 客户端断开时向手机端推送断开通知。`None` 表示手机端尚未建立 WebSocket。
     pub mobile_control_tx: Option<mpsc::UnboundedSender<String>>,
     /// 手机端设备信息（通常为握手时采集的 User-Agent）。
+    ///
+    /// 兼容/预留字段：实际发往 PC 端 `MobileConnected` 事件的 `device_info` 来自 WebSocket
+    /// 握手阶段的局部变量，不从此字段读取；保留此字段以备后续诊断扩展，暂不在读路径中直接消费。
     #[allow(dead_code)]
     pub device_info: Option<String>,
     /// 稳定 pairing 标识；旧客户端为空。
@@ -52,3 +58,31 @@ pub type SessionStore = Arc<DashMap<String, Session>>;
 
 /// 创建一个空的 [`SessionStore`]。
 pub fn new_store() -> SessionStore { Arc::new(DashMap::new()) }
+
+/// 返回指定配对最新活跃会话在 [`SessionStore`] 中的 key（即 session token）。
+///
+/// 注意：此处返回的是 **SessionStore 的 key**（UUID v4 字符串，用于 QR URL 及会话查找），
+/// 而非 `Session.grpc_session_token`（用于 Ping RPC 鉴权的另一个令牌）。
+///
+/// 优先从 [`crate::pairing::PairingEntry::active_session_token`] 直接取值（O(1)），若该
+/// 令牌已从 [`SessionStore`] 中清除则回退到全表扫描，保证兼容旧会话缺失索引的情况。
+pub fn latest_session_token(
+    store: &SessionStore,
+    pairing_store: &PairingStore,
+    pairing_id: Uuid,
+) -> Option<String> {
+    pairing_store
+        .get(&pairing_id)
+        .and_then(|entry| entry.active_session_token.clone())
+        .filter(|token| store.contains_key(token.as_str()))
+        .or_else(|| {
+            store
+                .iter()
+                .filter_map(|session| {
+                    (session.pairing_id == Some(pairing_id))
+                        .then(|| (session.key().clone(), session.created_at))
+                })
+                .max_by_key(|(_, created_at)| *created_at)
+                .map(|(token, _)| token)
+        })
+}

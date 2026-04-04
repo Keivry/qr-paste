@@ -179,6 +179,9 @@ pub fn secret_regex() -> &'static Regex {
 }
 
 /// 生成 32 个加密安全的随机字节。
+///
+/// 当前实现仅使用线程本地 RNG 填充固定长度缓冲区，实际上不会返回 Err；保留
+/// `anyhow::Result` 仅为兼容现有调用点与后续可能演化为可失败实现的空间。
 pub fn random_bytes_32() -> anyhow::Result<[u8; 32]> {
     let mut bytes = [0_u8; 32];
     rand::rng().fill(&mut bytes[..]);
