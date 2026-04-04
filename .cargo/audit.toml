@@ -1,5 +1,5 @@
 # cargo-audit 配置
-# 以下警告均为无法直接修复的传递依赖问题，已在此处显式说明原因后忽略。
+# 以下警告均为当前发布目标上无法直接修复的传递依赖问题，已在此处显式说明原因后忽略。
 
 [advisories]
 ignore = [
@@ -19,9 +19,4 @@ ignore = [
 
     # proc-macro-error：已不再维护（通过 glib-macros → GTK 链路引入，同上）
     "RUSTSEC-2024-0370",  # proc-macro-error
-
-    # paste：已不再维护（通过 rav1e → ravif → image 链路引入）
-    # rav1e 是 image crate 的可选 AVIF 编解码后端，本项目仅用 image 解码 PNG 图标；
-    # 无可用的修复上游版本。
-    "RUSTSEC-2024-0436",  # paste
 ]
