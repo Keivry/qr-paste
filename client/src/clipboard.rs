@@ -85,7 +85,9 @@ pub fn restore_clipboard(
 
 /// 将文本写入系统剪贴板。
 ///
-/// 使用 `arboard` crate 访问系统剪贴板。
+/// 在 Windows 上使用 Win32 API 直接写入，并设置
+/// `ExcludeClipboardContentFromMonitorProcessing` 格式，阻止剪贴板历史（Win+V）记录本次写入。
+/// 其他平台使用 `arboard` crate。
 ///
 /// # Errors
 ///
@@ -95,11 +97,89 @@ pub fn write_to_clipboard(text: &str) -> Result<(), String> {
     if text.is_empty() {
         return Ok(());
     }
-    let mut clipboard =
-        arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {e}"))?;
-    clipboard
-        .set_text(text)
-        .map_err(|e| format!("Clipboard write failed: {e}"))
+    #[cfg(target_os = "windows")]
+    {
+        write_to_clipboard_win32(text)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut clipboard =
+            arboard::Clipboard::new().map_err(|e| format!("Clipboard init failed: {e}"))?;
+        clipboard
+            .set_text(text)
+            .map_err(|e| format!("Clipboard write failed: {e}"))
+    }
+}
+
+/// Windows 专用剪贴板写入：通过 Win32 API 写入 CF_UNICODETEXT，
+/// 并在同一次 OpenClipboard/CloseClipboard 周期内写入
+/// `ExcludeClipboardContentFromMonitorProcessing` 格式（值为 NULL），
+/// 使 Windows 剪贴板历史（Win+V）不记录本次写入。
+#[cfg(target_os = "windows")]
+fn write_to_clipboard_win32(text: &str) -> Result<(), String> {
+    use windows_sys::Win32::{
+        Foundation::{GlobalFree, HANDLE},
+        System::{
+            DataExchange::{
+                CloseClipboard,
+                EmptyClipboard,
+                OpenClipboard,
+                RegisterClipboardFormatW,
+                SetClipboardData,
+            },
+            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
+        },
+    };
+
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_len = utf16.len() * 2;
+
+    unsafe {
+        if OpenClipboard(0) == 0 {
+            return Err("OpenClipboard failed".to_string());
+        }
+
+        let result = (|| -> Result<(), String> {
+            if EmptyClipboard() == 0 {
+                return Err("EmptyClipboard failed".to_string());
+            }
+
+            let hmem = GlobalAlloc(GMEM_MOVEABLE, byte_len);
+            if hmem.is_null() {
+                return Err("GlobalAlloc failed".to_string());
+            }
+
+            let ptr = GlobalLock(hmem);
+            if ptr.is_null() {
+                GlobalFree(hmem);
+                return Err("GlobalLock failed".to_string());
+            }
+            std::ptr::copy_nonoverlapping(utf16.as_ptr().cast::<u8>(), ptr.cast::<u8>(), byte_len);
+            GlobalUnlock(hmem);
+
+            const CF_UNICODETEXT: u32 = 13;
+            if SetClipboardData(CF_UNICODETEXT, hmem as usize as HANDLE) == 0 {
+                // SetClipboardData 失败时所有权未转移，必须手动释放
+                GlobalFree(hmem);
+                return Err("SetClipboardData(CF_UNICODETEXT) failed".to_string());
+            }
+            // SetClipboardData 成功后所有权已转移给系统，不再 GlobalFree
+
+            let exclude_format_name: Vec<u16> = "ExcludeClipboardContentFromMonitorProcessing"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let exclude_fmt = RegisterClipboardFormatW(exclude_format_name.as_ptr());
+            if exclude_fmt != 0 {
+                SetClipboardData(exclude_fmt, 0isize);
+            }
+
+            Ok(())
+        })();
+
+        CloseClipboard();
+        result
+    }
 }
 
 /// 模拟按下 `Ctrl+V` 组合键，将剪贴板内容粘贴到当前焦点输入框。
@@ -190,7 +270,7 @@ pub fn parse_key_spec(s: &str) -> Option<(Option<enigo::Key>, enigo::Key)> {
 /// 若 `enigo` 初始化失败则记录告警并退出。
 pub fn simulate_key(modifier: Option<enigo::Key>, key: enigo::Key, delay_ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-    use enigo::{Enigo, Keyboard, Settings};
+    use enigo::{Enigo, Key, Keyboard, Settings};
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(e) => e,
         Err(err) => {
@@ -204,7 +284,14 @@ pub fn simulate_key(modifier: Option<enigo::Key>, key: enigo::Key, delay_ms: u64
         tracing::warn!("Failed to press modifier key: {err}");
         return;
     }
-    if let Err(err) = enigo.key(key, enigo::Direction::Click) {
+    let result = if modifier.is_none()
+        && let Key::Unicode(c) = key
+    {
+        enigo.text(&c.to_string())
+    } else {
+        enigo.key(key, enigo::Direction::Click)
+    };
+    if let Err(err) = result {
         tracing::warn!("Failed to send key: {err}");
     }
     if let Some(m) = modifier

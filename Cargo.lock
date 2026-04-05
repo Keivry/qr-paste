@@ -794,6 +794,7 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "uuid",
+ "windows-sys 0.52.0",
  "winresource",
 ]
 

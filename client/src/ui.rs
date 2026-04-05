@@ -78,8 +78,8 @@ pub struct App {
     revoke_state: RevokeState,
     /// 当前重连退避间隔（指数增长，上限 reconnect_max_interval_secs）。
     reconnect_delay: Duration,
-    /// 防止重复调度重连：`true` 表示已调度，下一帧执行 `start_grpc()`。
-    reconnect_pending: bool,
+    /// 下次允许重连的时刻；`None` 表示无待执行的重连。
+    reconnect_at: Option<Instant>,
 }
 
 impl App {
@@ -134,7 +134,7 @@ impl App {
             last_public_base_url: None,
             revoke_state: RevokeState::Idle,
             reconnect_delay: Duration::from_secs(2),
-            reconnect_pending: false,
+            reconnect_at: None,
         }
     }
 
@@ -223,9 +223,12 @@ impl eframe::App for App {
             self.revoke_state = next_state;
         }
 
-        // 重连调度：grpc_rx 已断开且 reconnect_pending，则启动新 gRPC 连接
-        if self.reconnect_pending && self.grpc_rx.is_none() {
-            self.reconnect_pending = false;
+        // 重连调度：grpc_rx 已断开且到达重连时刻，则启动新 gRPC 连接
+        if let Some(at) = self.reconnect_at
+            && self.grpc_rx.is_none()
+            && Instant::now() >= at
+        {
+            self.reconnect_at = None;
             self.start_grpc(ctx);
         }
 
@@ -339,11 +342,11 @@ impl eframe::App for App {
                     Err(TryRecvError::Disconnected) => {
                         self.grpc_rx = None;
                         let should_reconnect = !matches!(self.state, AppState::Error { .. });
-                        if should_reconnect && !self.reconnect_pending {
+                        if should_reconnect && self.reconnect_at.is_none() {
                             let max = Duration::from_secs(self.config.reconnect_max_interval_secs);
                             self.state = AppState::Connecting;
                             self.last_connect_status = Some("连接断开，正在重试...".to_string());
-                            self.reconnect_pending = true;
+                            self.reconnect_at = Some(Instant::now() + self.reconnect_delay);
                             ctx.request_repaint_after(self.reconnect_delay);
                             self.reconnect_delay = (self.reconnect_delay * 2).min(max);
                         }
