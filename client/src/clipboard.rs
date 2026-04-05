@@ -118,7 +118,7 @@ pub fn write_to_clipboard(text: &str) -> Result<(), String> {
 #[cfg(target_os = "windows")]
 fn write_to_clipboard_win32(text: &str) -> Result<(), String> {
     use windows_sys::Win32::{
-        Foundation::{GlobalFree, HANDLE},
+        Foundation::GlobalFree,
         System::{
             DataExchange::{
                 CloseClipboard,
@@ -135,7 +135,7 @@ fn write_to_clipboard_win32(text: &str) -> Result<(), String> {
     let byte_len = utf16.len() * 2;
 
     unsafe {
-        if OpenClipboard(0) == 0 {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
             return Err("OpenClipboard failed".to_string());
         }
 
@@ -158,7 +158,7 @@ fn write_to_clipboard_win32(text: &str) -> Result<(), String> {
             GlobalUnlock(hmem);
 
             const CF_UNICODETEXT: u32 = 13;
-            if SetClipboardData(CF_UNICODETEXT, hmem as usize as HANDLE) == 0 {
+            if SetClipboardData(CF_UNICODETEXT, hmem.cast()).is_null() {
                 // SetClipboardData 失败时所有权未转移，必须手动释放
                 GlobalFree(hmem);
                 return Err("SetClipboardData(CF_UNICODETEXT) failed".to_string());
@@ -171,7 +171,7 @@ fn write_to_clipboard_win32(text: &str) -> Result<(), String> {
                 .collect();
             let exclude_fmt = RegisterClipboardFormatW(exclude_format_name.as_ptr());
             if exclude_fmt != 0 {
-                SetClipboardData(exclude_fmt, 0isize);
+                SetClipboardData(exclude_fmt, std::ptr::null_mut());
             }
 
             Ok(())
