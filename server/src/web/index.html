@@ -79,6 +79,9 @@
     }
     .action-area {
       flex-shrink: 0;
+      position: sticky;
+      bottom: 0;
+      background: #f5f5f5;
       padding-top: 12px;
       padding-bottom: max(env(safe-area-inset-bottom, 0px), 8px);
     }
@@ -359,6 +362,12 @@
     }
 
     async function bootstrap() {
+      // 已有有效会话（如刷新），直接进入重连流程，无需再次验证配对 secret
+      if (!pairingSecret && localStorage.getItem("qr_paste_pairing_id") === pairingId) {
+        reconnectState = "idle"
+        startReconnect()
+        return
+      }
       if (!pairingSecret) {
         setStatus("缺少配对凭据，请重新扫码", "error")
         return

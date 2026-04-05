@@ -91,7 +91,7 @@
 - `heartbeat_interval_secs = 30`：客户端发送 gRPC Ping 的默认间隔；设为 `0` 可禁用主动心跳
 - `reconnect_max_interval_secs = 60`：扫码等待或已连接状态下断线后的指数退避重连上限（带少量抖动）
 - `enter_after_paste` 已废弃；请改用 `emulation_key_after_paste = "Return"` 完成等价迁移
-- `emulation_key_after_paste`：仅在 `auto_paste = true` 时生效；支持 `Return`、`Tab`、`Escape`、`Space`、`Backspace`、`Delete`、方向键、`F1-F12`、`Home`、`End`、`PageUp`、`PageDown`，以及单个修饰键前缀（如 `ctrl+Return`）
+- `emulation_key_after_paste`：仅在 `auto_paste = true` 时生效；支持 `Return`、`Tab`、`Escape`、`Space`、`Backspace`、`Delete`、方向键、`F1-F12`、`Home`、`End`、`PageUp`、`PageDown`，以及单个修饰键前缀（如 `ctrl+Return`）；也支持任意单个 Unicode 字符（如 `"A"`、`"a"`、`"ctrl+a"`）
 - `delete_clipboard_after_paste = true`：仅在 `auto_paste = true` 时启用；客户端会在自动粘贴完成后尽力还原文本剪贴板。若原始内容为非文本、读取失败，或还原前检测到剪贴板已被外部修改，则会安全跳过还原，且日志不会输出剪贴板明文内容
 - `grpc_keepalive_interval_secs = 60`：服务端 HTTP/2 keepalive 探测间隔；默认放宽到 60 秒以减少误判断连
 - `start_minimized = true`：启动时直接隐藏窗口，仅显示托盘图标

@@ -28,6 +28,7 @@ auto_paste = false
 # 支持格式："Return"、"Tab"、"Escape"、"Space"、"Backspace"、"Delete"
 # 也支持 "Up"/"Down"/"Left"/"Right"、"F1"-"F12"、"Home"/"End"、"PageUp"/"PageDown"
 # 也支持带单个修饰键：如 "ctrl+Return"、"shift+Tab"、"alt+PageDown"、"meta+Right"
+# 也支持任意单个 Unicode 字符：如 "A"、"a"、"ctrl+a"
 # emulation_key_after_paste = "Return"
 
 # 自动粘贴前的延迟毫秒数（等待剪贴板写入完成），默认 150

@@ -131,7 +131,7 @@ impl App {
             last_grpc_session_token: None,
             last_public_base_url: None,
             revoke_state: RevokeState::Idle,
-            reconnect_delay: Duration::from_secs(1),
+            reconnect_delay: Duration::from_secs(2),
             reconnect_pending: false,
         }
     }
@@ -263,7 +263,7 @@ impl eframe::App for App {
                             self.last_session_token = Some(token);
                             self.last_public_base_url = public_base_url_from_session_url(&url);
                             // 重连成功，重置退避间隔
-                            self.reconnect_delay = Duration::from_secs(1);
+                            self.reconnect_delay = Duration::from_secs(2);
                             let texture = generate_qr_texture(ctx, &url);
                             self.state = AppState::WaitingScan {
                                 qr_texture: texture,
@@ -479,7 +479,7 @@ fn start_clipboard_worker(
                 if let Some(key_spec) = &job.emulation_key_after_paste
                     && let Some((modifier, key)) = clipboard::parse_key_spec(key_spec)
                 {
-                    clipboard::simulate_key(modifier, key);
+                    clipboard::simulate_key(modifier, key, 50);
                 }
             }
 
@@ -491,10 +491,11 @@ fn start_clipboard_worker(
             let _ = clipboard_notice_tx.send(notice);
             repaint_ctx.request_repaint();
 
-            if let Some(ref snap) = snapshot
-                && let Err(e) = clipboard::restore_clipboard(snap, &job.content)
-            {
-                tracing::warn!("还原剪贴板失败: {e}");
+            if let Some(ref snap) = snapshot {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                if let Err(e) = clipboard::restore_clipboard(snap, &job.content) {
+                    tracing::warn!("还原剪贴板失败: {e}");
+                }
             }
         }
     });

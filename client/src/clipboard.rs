@@ -175,6 +175,7 @@ pub fn parse_key_spec(s: &str) -> Option<(Option<enigo::Key>, enigo::Key)> {
         "End" => Key::End,
         "PageUp" => Key::PageUp,
         "PageDown" => Key::PageDown,
+        s if s.chars().count() == 1 => Key::Unicode(s.chars().next().unwrap()),
         unknown => {
             tracing::warn!("Unknown key name in key spec '{s}': '{unknown}'");
             return None;
@@ -185,8 +186,10 @@ pub fn parse_key_spec(s: &str) -> Option<(Option<enigo::Key>, enigo::Key)> {
 
 /// 模拟按下指定按键（可选修饰键）。
 ///
+/// 在按键前等待 `delay_ms` 毫秒，以确保上一个按键事件已被目标应用处理。
 /// 若 `enigo` 初始化失败则记录告警并退出。
-pub fn simulate_key(modifier: Option<enigo::Key>, key: enigo::Key) {
+pub fn simulate_key(modifier: Option<enigo::Key>, key: enigo::Key, delay_ms: u64) {
+    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     use enigo::{Enigo, Keyboard, Settings};
     let mut enigo = match Enigo::new(&Settings::default()) {
         Ok(e) => e,
@@ -235,11 +238,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_key_spec_accepts_single_unicode_char() {
+        assert_eq!(parse_key_spec("A"), Some((None, Key::Unicode('A'))));
+        assert_eq!(parse_key_spec("a"), Some((None, Key::Unicode('a'))));
+        assert_eq!(
+            parse_key_spec("ctrl+a"),
+            Some((Some(Key::Control), Key::Unicode('a')))
+        );
+    }
+
+    #[test]
     fn parse_key_spec_rejects_unknown_or_multi_modifier_keys() {
         assert_eq!(parse_key_spec("enter"), None);
         assert_eq!(parse_key_spec("ctrl+shift+Tab"), None);
         assert_eq!(parse_key_spec("super+Return"), None);
-        assert_eq!(parse_key_spec("A"), None);
     }
 
     #[test]
