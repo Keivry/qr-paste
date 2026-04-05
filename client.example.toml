@@ -34,6 +34,15 @@ auto_paste = false
 # 自动粘贴前的延迟毫秒数（等待剪贴板写入完成），默认 150
 paste_delay_ms = 150
 
+# 模拟附加按键（emulation_key_after_paste）之前的等待毫秒数，默认 50
+# 仅在 auto_paste = true 且配置了 emulation_key_after_paste 时生效
+# key_after_paste_delay_ms = 50
+
+# 还原剪贴板（delete_clipboard_after_paste）之前的等待毫秒数，默认 200
+# 在慢速系统、虚拟机或远程桌面等环境下可适当调大此值
+# 仅在 auto_paste = true 且 delete_clipboard_after_paste = true 时生效
+# restore_clipboard_delay_ms = 200
+
 # gRPC 心跳间隔（秒），默认 30；设为 0 可禁用客户端主动 Ping
 # 用于在扫码等待或已连接期间维持长连接活性
 heartbeat_interval_secs = 30

@@ -36,6 +36,15 @@ pub struct ClientConfig {
     pub emulation_key_after_paste: Option<String>,
     /// 自动粘贴前的等待毫秒数，给剪贴板写入操作留出时间。默认 150 ms。
     pub paste_delay_ms: u64,
+    /// 模拟附加按键（`emulation_key_after_paste`）之前的等待毫秒数。默认 50 ms。
+    ///
+    /// 仅在 `auto_paste = true` 且配置了 `emulation_key_after_paste` 时生效。
+    pub key_after_paste_delay_ms: u64,
+    /// 还原剪贴板（`delete_clipboard_after_paste`）之前的等待毫秒数。默认 200 ms。
+    ///
+    /// 在慢速系统、虚拟机或远程桌面下可适当调大此值，确保目标应用有足够时间处理 Ctrl+V。
+    /// 仅在 `auto_paste = true` 且 `delete_clipboard_after_paste = true` 时生效。
+    pub restore_clipboard_delay_ms: u64,
     /// 自动粘贴完成后是否还原剪贴板为粘贴前的原始内容。默认 `false`。
     ///
     /// 仅在 `auto_paste = true` 时生效。粘贴后尽力还原剪贴板为原始文本；
@@ -63,6 +72,8 @@ fn default_https_grpc_port() -> u16 { 443 }
 fn default_auto_paste() -> bool { false }
 fn default_enter_after_paste() -> bool { false }
 fn default_paste_delay_ms() -> u64 { 150 }
+fn default_key_after_paste_delay_ms() -> u64 { 50 }
+fn default_restore_clipboard_delay_ms() -> u64 { 200 }
 fn default_start_minimized() -> bool { false }
 fn default_minimize_on_close() -> bool { false }
 fn default_notification_duration_secs() -> u64 { 3 }
@@ -85,6 +96,10 @@ struct RawClientConfig {
     emulation_key_after_paste: Option<String>,
     #[serde(default = "default_paste_delay_ms")]
     paste_delay_ms: u64,
+    #[serde(default = "default_key_after_paste_delay_ms")]
+    key_after_paste_delay_ms: u64,
+    #[serde(default = "default_restore_clipboard_delay_ms")]
+    restore_clipboard_delay_ms: u64,
     #[serde(default = "default_start_minimized")]
     start_minimized: bool,
     #[serde(default = "default_minimize_on_close")]
@@ -119,6 +134,8 @@ impl From<RawClientConfig> for ClientConfig {
                 }
             }),
             paste_delay_ms: raw.paste_delay_ms,
+            key_after_paste_delay_ms: raw.key_after_paste_delay_ms,
+            restore_clipboard_delay_ms: raw.restore_clipboard_delay_ms,
             start_minimized: raw.start_minimized,
             minimize_on_close: raw.minimize_on_close,
             notification_duration_secs: raw.notification_duration_secs,
@@ -294,6 +311,8 @@ mod tests {
         assert!(Uuid::parse_str(&cfg.pairing_id).is_ok() || cfg.pairing_id.is_empty());
         assert!(!cfg.auto_paste);
         assert_eq!(cfg.paste_delay_ms, 150);
+        assert_eq!(cfg.key_after_paste_delay_ms, 50);
+        assert_eq!(cfg.restore_clipboard_delay_ms, 200);
         assert!(!cfg.start_minimized);
         assert!(!cfg.minimize_on_close);
         assert_eq!(cfg.notification_duration_secs, 3);
@@ -311,6 +330,8 @@ mod tests {
             pairing_id = "123e4567-e89b-12d3-a456-426614174000"
             auto_paste = false
             paste_delay_ms = 300
+            key_after_paste_delay_ms = 80
+            restore_clipboard_delay_ms = 350
             start_minimized = true
             minimize_on_close = true
             notification_duration_secs = 10
@@ -324,6 +345,8 @@ mod tests {
         assert_eq!(cfg.pairing_id, "123e4567-e89b-12d3-a456-426614174000");
         assert!(!cfg.auto_paste);
         assert_eq!(cfg.paste_delay_ms, 300);
+        assert_eq!(cfg.key_after_paste_delay_ms, 80);
+        assert_eq!(cfg.restore_clipboard_delay_ms, 350);
         assert!(cfg.start_minimized);
         assert!(cfg.minimize_on_close);
         assert_eq!(cfg.notification_duration_secs, 10);

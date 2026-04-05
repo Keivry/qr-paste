@@ -50,6 +50,8 @@ struct ClipboardJob {
     emulation_key_after_paste: Option<String>,
     delete_clipboard_after_paste: bool,
     paste_delay_ms: u64,
+    key_after_paste_delay_ms: u64,
+    restore_clipboard_delay_ms: u64,
     notice_content: String,
 }
 
@@ -306,6 +308,8 @@ impl eframe::App for App {
                                     .config
                                     .delete_clipboard_after_paste,
                                 paste_delay_ms: self.config.paste_delay_ms,
+                                key_after_paste_delay_ms: self.config.key_after_paste_delay_ms,
+                                restore_clipboard_delay_ms: self.config.restore_clipboard_delay_ms,
                                 notice_content,
                             }) {
                                 match e {
@@ -479,7 +483,7 @@ fn start_clipboard_worker(
                 if let Some(key_spec) = &job.emulation_key_after_paste
                     && let Some((modifier, key)) = clipboard::parse_key_spec(key_spec)
                 {
-                    clipboard::simulate_key(modifier, key, 50);
+                    clipboard::simulate_key(modifier, key, job.key_after_paste_delay_ms);
                 }
             }
 
@@ -492,7 +496,9 @@ fn start_clipboard_worker(
             repaint_ctx.request_repaint();
 
             if let Some(ref snap) = snapshot {
-                std::thread::sleep(std::time::Duration::from_millis(150));
+                std::thread::sleep(std::time::Duration::from_millis(
+                    job.restore_clipboard_delay_ms,
+                ));
                 if let Err(e) = clipboard::restore_clipboard(snap, &job.content) {
                     tracing::warn!("还原剪贴板失败: {e}");
                 }
