@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+name: Release Server
+
+on:
+  push:
+    tags:
+      - "server-v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name for the release, for example server-v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-server:
+    name: Build Server (Linux x86_64)
+    runs-on: ubuntu-22.04
+    outputs:
+      archive: ${{ steps.package.outputs.archive }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: "29.3"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-ubuntu22
+
+      - name: Build server
+        run: cargo build --release --locked -p server
+
+      - name: Package server archive
+        id: package
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW_TAG="${{ inputs.tag }}"
+          else
+            RAW_TAG="${GITHUB_REF_NAME}"
+          fi
+          VERSION="${RAW_TAG#server-}"
+          ARCHIVE="qr-paste-server-linux-x86_64-${VERSION}.tar.gz"
+          mkdir -p dist
+          cp target/release/qr-paste-server dist/
+          cp server.example.toml dist/
+          cp docs/nginx.conf.example dist/
+          cp docs/haproxy.cfg.example dist/
+          cp LICENSE-MIT dist/
+          cp LICENSE-APACHE dist/
+          tar -czf "${ARCHIVE}" -C dist .
+          echo "archive=${ARCHIVE}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-artifact
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build-server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: "*-artifact"
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: "*.tar.gz"
+          generate_release_notes: true
