@@ -255,10 +255,15 @@ pub fn parse_key_spec(s: &str) -> Option<(Option<enigo::Key>, enigo::Key)> {
         "End" => Key::End,
         "PageUp" => Key::PageUp,
         "PageDown" => Key::PageDown,
-        s if s.chars().count() == 1 => Key::Unicode(s.chars().next().unwrap()),
-        unknown => {
-            tracing::warn!("Unknown key name in key spec '{s}': '{unknown}'");
-            return None;
+        s => {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Key::Unicode(c),
+                _ => {
+                    tracing::warn!("Unknown key name in key spec '{s}': '{s}'");
+                    return None;
+                }
+            }
         }
     };
     Some((modifier, key))

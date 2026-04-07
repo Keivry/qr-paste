@@ -7,6 +7,13 @@ use {
     url::{Host, Url},
 };
 
+/// 受信任的反向代理 CIDR 白名单。
+///
+/// 只有 TCP 连接来源 IP 在此列表内的请求，服务端才会解析转发头（`X-Forwarded-For` /
+/// `X-Real-IP`）来确定真实客户端 IP。列表为空时始终使用 TCP peer IP。
+///
+/// ⚠️ 仅在服务端确实部署在可信反向代理之后，且代理 IP 已知时才配置此项；
+/// 配置错误会导致攻击者通过伪造 XFF 头绕过 IP 限流。
 #[derive(Clone)]
 pub struct TrustedProxyCidrs {
     networks: Arc<[IpNet]>,
@@ -29,6 +36,10 @@ impl fmt::Debug for TrustedProxyCidrs {
 }
 
 impl TrustedProxyCidrs {
+    /// 从字符串 CIDR 列表解析受信任代理网段。
+    ///
+    /// 每个字符串须为合法的 CIDR 表示法（如 `"127.0.0.1/32"`、`"10.0.0.0/8"`）；
+    /// 空字符串或非法 CIDR 会直接返回错误。
     pub fn parse(values: &[String]) -> anyhow::Result<Self> {
         let mut networks = Vec::with_capacity(values.len());
         for value in values {
@@ -46,12 +57,18 @@ impl TrustedProxyCidrs {
         })
     }
 
+    /// 判断给定的 peer IP 是否在受信任代理 CIDR 范围内。
     pub fn trusts_peer(&self, peer_ip: IpAddr) -> bool {
         self.networks
             .iter()
             .any(|network| network.contains(&peer_ip))
     }
 
+    /// 根据代理信任规则解析请求的真实客户端 IP。
+    ///
+    /// 若 `peer_ip` 不在受信任 CIDR 范围内，直接返回 `peer_ip`；
+    /// 否则，当 `X-Forwarded-For` 存在时取其最右侧 IP（解析失败则回退 `peer_ip`）；
+    /// `X-Forwarded-For` 缺失时尝试 `X-Real-IP`，仍缺失或无效则返回 `peer_ip`。
     pub fn resolve_client_ip(
         &self,
         peer_ip: IpAddr,
