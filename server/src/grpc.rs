@@ -9,6 +9,7 @@ use {
     crate::{
         config::{ServerConfig, TrustedProxyCidrs},
         pairing::{PairingEntry, PairingStore, encode_hex, random_bytes_32},
+        persist::PersistenceStore,
         session::{Session, SessionStore, latest_session_token},
     },
     common::ServerToMobileMessage,
@@ -45,6 +46,7 @@ pub struct ClientRelayService {
     config: ServerConfig,
     trusted_proxies: TrustedProxyCidrs,
     grpc_tokens: Arc<DashMap<String, ()>>,
+    persist: Option<Arc<PersistenceStore>>,
 }
 
 impl ClientRelayService {
@@ -53,6 +55,7 @@ impl ClientRelayService {
         store: SessionStore,
         pairing_store: PairingStore,
         config: ServerConfig,
+        persist: Option<Arc<PersistenceStore>>,
     ) -> anyhow::Result<Self> {
         let trusted_proxies = config.trusted_proxy_ranges()?;
         Ok(Self {
@@ -61,6 +64,7 @@ impl ClientRelayService {
             config,
             trusted_proxies,
             grpc_tokens: Arc::new(DashMap::new()),
+            persist,
         })
     }
 }
@@ -74,6 +78,7 @@ pub struct SessionStream {
     token: String,
     grpc_session_token: String,
     grpc_tokens: Arc<DashMap<String, ()>>,
+    persist: Option<Arc<PersistenceStore>>,
 }
 
 impl std::fmt::Debug for SessionStream {
@@ -103,6 +108,7 @@ impl Drop for SessionStream {
             &self.pairing_store,
             self.pairing_ttl_secs,
             &self.token,
+            self.persist.as_deref(),
         )
     }
 }
@@ -143,7 +149,13 @@ impl ClientRelay for ClientRelayService {
         let grpc_session_token = Uuid::new_v4().to_string();
         let pairing_id = Uuid::parse_str(&request.get_ref().pairing_id)
             .map_err(|_| Status::invalid_argument("pairing_id must be a valid UUID"))?;
-        let (url, _) = upsert_pairing(&self.pairing_store, &self.config, pairing_id, &token)?;
+        let (url, _) = upsert_pairing(
+            &self.pairing_store,
+            &self.config,
+            pairing_id,
+            &token,
+            self.persist.as_deref(),
+        )?;
 
         let (tx, rx) = mpsc::channel(32);
 
@@ -185,6 +197,7 @@ impl ClientRelay for ClientRelayService {
             token,
             grpc_session_token,
             grpc_tokens: Arc::clone(&self.grpc_tokens),
+            persist: self.persist.clone(),
         };
 
         Ok(Response::new(stream))
@@ -207,6 +220,7 @@ fn cleanup_session_on_client_disconnect(
     pairing_store: &PairingStore,
     pairing_ttl_secs: u64,
     token: &str,
+    persist: Option<&PersistenceStore>,
 ) {
     let Some((_, session)) = store.remove(token) else {
         return;
@@ -240,6 +254,16 @@ fn cleanup_session_on_client_disconnect(
         entry.last_seen = now;
         entry.expires_at = now + Duration::from_secs(pairing_ttl_secs);
         entry.revision = entry.revision.saturating_add(1);
+        if let Some(p) = persist {
+            p.save_pairing(
+                entry.pairing_id,
+                entry.pairing_secret,
+                entry.epoch,
+                entry.last_seen,
+                entry.expires_at,
+                entry.revision,
+            );
+        }
     }
 
     let message = serde_json::to_string(&ServerToMobileMessage::ClientDisconnected)
@@ -258,11 +282,17 @@ pub async fn serve(
     store: SessionStore,
     pairing_store: PairingStore,
     config: ServerConfig,
+    persist: Option<Arc<PersistenceStore>>,
 ) -> anyhow::Result<()> {
     let keepalive_interval = Duration::from_secs(config.grpc_keepalive_interval_secs);
     let keepalive_timeout = Duration::from_secs(config.grpc_keepalive_timeout_secs);
 
-    let svc = ClientRelayServer::new(ClientRelayService::new(store, pairing_store, config)?);
+    let svc = ClientRelayServer::new(ClientRelayService::new(
+        store,
+        pairing_store,
+        config,
+        persist,
+    )?);
 
     tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(keepalive_interval))
@@ -301,6 +331,7 @@ fn upsert_pairing(
     config: &ServerConfig,
     pairing_id: Uuid,
     session_token: &str,
+    persist: Option<&PersistenceStore>,
 ) -> Result<(String, [u8; 32]), Status> {
     let now = std::time::Instant::now();
     let public_base_url = config.public_base_url.trim_end_matches('/');
@@ -317,6 +348,16 @@ fn upsert_pairing(
             "{public_base_url}/m/{pairing_id}#ps={}",
             encode_hex(&secret)
         );
+        if let Some(p) = persist {
+            p.save_pairing(
+                entry.pairing_id,
+                entry.pairing_secret,
+                entry.epoch,
+                entry.last_seen,
+                entry.expires_at,
+                entry.revision,
+            );
+        }
         return Ok((url, secret));
     }
 
@@ -325,20 +366,28 @@ fn upsert_pairing(
         "{public_base_url}/m/{pairing_id}#ps={}",
         encode_hex(&secret)
     );
-    pairing_store.insert(
+    let entry = PairingEntry {
         pairing_id,
-        PairingEntry {
-            pairing_id,
-            pairing_secret: secret,
-            epoch: 0,
-            online: true,
-            last_seen: now,
-            expires_at: now + ttl,
-            active_session_token: Some(session_token.to_string()),
-            active_mobile_ws: None,
-            revision: 0,
-        },
-    );
+        pairing_secret: secret,
+        epoch: 0,
+        online: true,
+        last_seen: now,
+        expires_at: now + ttl,
+        active_session_token: Some(session_token.to_string()),
+        active_mobile_ws: None,
+        revision: 0,
+    };
+    if let Some(p) = persist {
+        p.save_pairing(
+            entry.pairing_id,
+            entry.pairing_secret,
+            entry.epoch,
+            entry.last_seen,
+            entry.expires_at,
+            entry.revision,
+        );
+    }
+    pairing_store.insert(pairing_id, entry);
     Ok((url, secret))
 }
 
@@ -371,6 +420,7 @@ mod tests {
             grpc_keepalive_timeout_secs: 20,
             log_level: "info".to_string(),
             trusted_proxy_cidrs: Vec::new(),
+            persistence_path: String::new(),
         }
     }
 
@@ -382,6 +432,7 @@ mod tests {
             new_store(),
             crate::pairing::new_pairing_store(),
             test_config(),
+            None,
         )
         .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
@@ -403,6 +454,7 @@ mod tests {
             new_store(),
             crate::pairing::new_pairing_store(),
             test_config(),
+            None,
         )
         .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
@@ -422,7 +474,7 @@ mod tests {
     async fn subscribe_creates_session_and_sends_first_event() {
         let store = new_store();
         let pairing_store = crate::pairing::new_pairing_store();
-        let service = ClientRelayService::new(store.clone(), pairing_store, test_config())
+        let service = ClientRelayService::new(store.clone(), pairing_store, test_config(), None)
             .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
             auth_token: "shared-secret-xx".to_string(),
@@ -462,8 +514,9 @@ mod tests {
     async fn dropping_grpc_stream_removes_session() {
         let store = new_store();
         let pairing_store = crate::pairing::new_pairing_store();
-        let service = ClientRelayService::new(store.clone(), pairing_store.clone(), test_config())
-            .expect("test config should be valid");
+        let service =
+            ClientRelayService::new(store.clone(), pairing_store.clone(), test_config(), None)
+                .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
             auth_token: "shared-secret-xx".to_string(),
             pairing_id: TEST_PAIRING_ID.to_string(),
@@ -519,6 +572,7 @@ mod tests {
             &crate::pairing::new_pairing_store(),
             300,
             "token",
+            None,
         );
 
         assert!(!store.contains_key("token"));
@@ -592,7 +646,7 @@ mod tests {
         );
 
         let before = Instant::now();
-        cleanup_session_on_client_disconnect(&store, &pairing_store, 300, "token");
+        cleanup_session_on_client_disconnect(&store, &pairing_store, 300, "token", None);
         let after = Instant::now();
 
         let entry = pairing_store
@@ -656,7 +710,7 @@ mod tests {
             },
         );
 
-        cleanup_session_on_client_disconnect(&store, &pairing_store, 300, "older");
+        cleanup_session_on_client_disconnect(&store, &pairing_store, 300, "older", None);
 
         assert!(!store.contains_key("older"));
         let newer = store.get("newer").expect("newer session should remain");

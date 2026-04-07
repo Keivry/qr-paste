@@ -3,7 +3,7 @@
 //! 配对状态管理：配对条目、浏览器会话、WebSocket 票据及其存储的创建、验证与清理。
 
 use {
-    crate::{config::ServerConfig, session::SessionStore},
+    crate::{config::ServerConfig, persist::PersistenceStore, session::SessionStore},
     dashmap::DashMap,
     rand::RngExt,
     regex::Regex,
@@ -233,6 +233,7 @@ pub fn spawn_cleanup_task(
     browser_session_store: BrowserSessionStore,
     ws_ticket_store: WsTicketStore,
     cancellation: CancellationToken,
+    persist: Option<Arc<PersistenceStore>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(
@@ -247,7 +248,11 @@ pub fn spawn_cleanup_task(
                         &pairing_store,
                         &browser_session_store,
                         &ws_ticket_store,
+                        persist.as_deref(),
                     );
+                    if let Some(p) = &persist {
+                        p.delete_expired();
+                    }
                 }
             }
         }
@@ -294,6 +299,7 @@ fn cleanup_pairings(
     pairing_store: &PairingStore,
     browser_session_store: &BrowserSessionStore,
     ws_ticket_store: &WsTicketStore,
+    persist: Option<&PersistenceStore>,
 ) {
     let now = Instant::now();
     let mut removed_pairings = HashSet::new();
@@ -317,6 +323,9 @@ fn cleanup_pairings(
             .is_some()
         {
             removed_pairings.insert(pairing_id);
+            if let Some(p) = persist {
+                p.delete_pairing(pairing_id);
+            }
         }
     }
 
@@ -420,7 +429,12 @@ mod tests {
             },
         );
 
-        cleanup_pairings(&pairing_store, &browser_session_store, &ws_ticket_store);
+        cleanup_pairings(
+            &pairing_store,
+            &browser_session_store,
+            &ws_ticket_store,
+            None,
+        );
 
         assert!(pairing_store.contains_key(&pairing_id));
     }

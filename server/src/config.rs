@@ -149,6 +149,10 @@ pub struct ServerConfig {
     /// 则回退到 TCP 对端 IP。
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
+    /// SQLite 持久化数据库文件路径。默认 `"qr-paste-state.db"`（相对工作目录）。
+    /// 设为空字符串时禁用持久化（重启后所有配对信息丢失）。
+    #[serde(default = "default_persistence_path")]
+    pub persistence_path: String,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -187,6 +191,7 @@ impl fmt::Debug for ServerConfig {
             )
             .field("log_level", &self.log_level)
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
+            .field("persistence_path", &self.persistence_path)
             .finish()
     }
 }
@@ -205,6 +210,7 @@ fn default_ws_idle_timeout_secs() -> u64 { 90 }
 fn default_grpc_keepalive_interval_secs() -> u64 { 60 }
 fn default_grpc_keepalive_timeout_secs() -> u64 { 20 }
 fn default_log_level() -> String { "info".to_string() }
+fn default_persistence_path() -> String { "qr-paste-state.db".to_string() }
 
 impl ServerConfig {
     /// 从当前工作目录下的 `server.toml` 加载配置。

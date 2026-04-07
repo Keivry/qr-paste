@@ -25,6 +25,7 @@ use {
             random_bytes_32,
             verify_secret,
         },
+        persist::PersistenceStore,
         session::{SessionStore, latest_session_token},
     },
     axum::{
@@ -129,6 +130,8 @@ pub struct AppState {
     /// `POST /api/pairing/{pairing_id}/revoke` 撤销路由中按 gRPC session token 维度的限流器，
     /// 防止同一 token 的撤销请求被暴力重试。
     pub revoke_session_limiter: KeyedLimiter<String>,
+    /// 持久化存储句柄，为 `None` 时禁用持久化。
+    pub persist: Option<Arc<PersistenceStore>>,
 }
 
 #[derive(Deserialize)]
@@ -170,6 +173,7 @@ pub async fn serve(
     browser_session_store: BrowserSessionStore,
     ws_ticket_store: WsTicketStore,
     config: ServerConfig,
+    persist: Option<Arc<PersistenceStore>>,
 ) -> anyhow::Result<()> {
     let trusted_proxies = config.trusted_proxy_ranges()?;
     serve_inner(
@@ -180,10 +184,13 @@ pub async fn serve(
         ws_ticket_store,
         config,
         TrustedClientIpKeyExtractor::new(trusted_proxies),
+        persist,
     )
     .await
 }
 
+// serve_inner 参数数量受 AppState 字段和泛型 key_extractor 约束，无法合理减少，豁免此 lint。
+#[allow(clippy::too_many_arguments)]
 async fn serve_inner<K>(
     addr: SocketAddr,
     store: SessionStore,
@@ -192,6 +199,7 @@ async fn serve_inner<K>(
     ws_ticket_store: WsTicketStore,
     config: ServerConfig,
     key_extractor: K,
+    persist: Option<Arc<PersistenceStore>>,
 ) -> anyhow::Result<()>
 where
     K: tower_governor::key_extractor::KeyExtractor + Clone + Send + Sync + 'static,
@@ -209,6 +217,7 @@ where
         ws_ticket_limiter: keyed_limiter(12),
         revoke_pairing_limiter: keyed_limiter(5),
         revoke_session_limiter: keyed_limiter(10),
+        persist,
     };
 
     let http_rate = config.http_rate_limit_per_ip_per_min;
@@ -442,6 +451,18 @@ async fn handle_bootstrap(
             expires_at: now + Duration::from_secs(30 * 24 * 60 * 60),
             revoked: false,
         };
+        if let Some(p) = state.persist.as_deref() {
+            p.delete_browser_sessions_for_pairing(pairing_id);
+            p.save_browser_session(
+                browser_session.session_id,
+                browser_session.pairing_id,
+                browser_session.pairing_epoch,
+                browser_session.created_at,
+                browser_session.last_seen,
+                browser_session.expires_at,
+                browser_session.revoked,
+            );
+        }
         state
             .browser_session_store
             .insert(session_id, browser_session);
@@ -460,6 +481,16 @@ async fn handle_bootstrap(
             pairing_id,
             encode_hex(&new_secret)
         );
+        if let Some(p) = state.persist.as_deref() {
+            p.save_pairing(
+                entry.pairing_id,
+                entry.pairing_secret,
+                entry.epoch,
+                entry.last_seen,
+                entry.expires_at,
+                entry.revision,
+            );
+        }
         drop(entry);
 
         let notify_session_token = active_token
@@ -679,6 +710,17 @@ async fn handle_revoke(
                 code: 4002,
                 reason: "revoked",
             });
+        }
+        if let Some(p) = state.persist.as_deref() {
+            p.save_pairing(
+                entry.pairing_id,
+                entry.pairing_secret,
+                entry.epoch,
+                entry.last_seen,
+                entry.expires_at,
+                entry.revision,
+            );
+            p.delete_browser_sessions_for_pairing(pairing_id);
         }
         (entry.epoch, new_secret)
     };
