@@ -5,12 +5,13 @@ mod grpc;
 mod pairing;
 mod persist;
 mod session;
+mod upload_store;
 mod web;
 
 use {
     std::{net::SocketAddr, sync::Arc},
     tokio_util::sync::CancellationToken,
-    tracing::error,
+    tracing::{error, info},
     tracing_subscriber::EnvFilter,
 };
 
@@ -68,6 +69,21 @@ async fn main() -> anyhow::Result<()> {
         Some(store_arc)
     };
 
+    validate_upload_dir(&cfg.upload_dir)?;
+    info!("upload_dir 就绪: {}", cfg.upload_dir.display());
+
+    let upload_store = upload_store::new_upload_store(
+        cfg.max_upload_size_bytes,
+        cfg.max_pending_upload_files_per_pairing,
+        cfg.max_pending_upload_files_global,
+        cfg.max_pending_upload_bytes_global,
+    );
+    let stats = upload_store.rebuild_baseline(&cfg.upload_dir, cfg.upload_file_retention_secs);
+    info!(
+        "upload_store 基线重建完成：扫描 {} 个文件，纳入基线 {} 个（{} 字节）",
+        stats.scanned, stats.accepted, stats.accepted_bytes
+    );
+
     let shutdown = CancellationToken::new();
     let _cleanup = pairing::spawn_cleanup_task(
         Arc::new(cfg.clone()),
@@ -77,7 +93,28 @@ async fn main() -> anyhow::Result<()> {
         ws_ticket_store.clone(),
         shutdown.clone(),
         persist.clone(),
+        upload_store.clone(),
     );
+
+    {
+        let upload_store_bg = upload_store.clone();
+        let upload_dir = cfg.upload_dir.clone();
+        let retention_secs = cfg.upload_file_retention_secs;
+        let cleanup_interval = cfg.upload_cleanup_interval_secs.max(1);
+        let cancel = shutdown.clone();
+        tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(cleanup_interval));
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => {
+                        upload_store_bg.cleanup_expired(&upload_dir, retention_secs).await;
+                    }
+                }
+            }
+        });
+    }
 
     tokio::select! {
         res = web::serve(
@@ -88,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
             ws_ticket_store.clone(),
             cfg.clone(),
             persist.clone(),
+            upload_store.clone(),
         ) => {
             shutdown.cancel();
             error!("HTTP server exited: {:?}", res);
@@ -99,6 +137,34 @@ async fn main() -> anyhow::Result<()> {
             res?
         },
     }
+
+    Ok(())
+}
+
+fn validate_upload_dir(upload_dir: &std::path::Path) -> anyhow::Result<()> {
+    if !upload_dir.exists() {
+        std::fs::create_dir_all(upload_dir)
+            .map_err(|e| anyhow::anyhow!("无法创建 upload_dir {}: {e}", upload_dir.display()))?;
+    }
+
+    let meta = std::fs::symlink_metadata(upload_dir)
+        .map_err(|e| anyhow::anyhow!("无法读取 upload_dir 元数据 {}: {e}", upload_dir.display()))?;
+
+    if !meta.is_dir() {
+        anyhow::bail!(
+            "upload_dir {} 不是普通目录（可能是文件或符号链接）",
+            upload_dir.display()
+        );
+    }
+
+    let probe_path = upload_dir.join(".qr_paste_write_probe");
+    std::fs::write(&probe_path, b"probe").map_err(|e| {
+        anyhow::anyhow!(
+            "upload_dir {} 不可写（权限或配额错误）: {e}",
+            upload_dir.display()
+        )
+    })?;
+    let _ = std::fs::remove_file(&probe_path);
 
     Ok(())
 }

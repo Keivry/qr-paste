@@ -421,6 +421,15 @@ mod tests {
             log_level: "info".to_string(),
             trusted_proxy_cidrs: Vec::new(),
             persistence_path: String::new(),
+            upload_dir: std::path::PathBuf::from("/tmp/qr-paste-test-uploads"),
+            max_upload_size_bytes: 52_428_800,
+            upload_file_retention_secs: 3600,
+            upload_cleanup_interval_secs: 300,
+            upload_rate_limit_per_ip_per_min: 6,
+            upload_body_timeout_secs: 30,
+            max_pending_upload_files_per_pairing: 20,
+            max_pending_upload_files_global: 500,
+            max_pending_upload_bytes_global: 2_147_483_648,
         }
     }
 

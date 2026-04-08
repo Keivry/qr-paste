@@ -20,6 +20,7 @@ message ServerEvent {
     MobileDisconnected mobile_disconnected = 3;
     ClipboardText clipboard_text = 4;
     Ping ping = 5;
+    FileReceived file_received = 7;
   }
   // 服务端在首帧 SessionToken 事件中附带的 gRPC 会话令牌，用于后续 Ping 鉴权。
   string grpc_session_token = 6;
@@ -41,6 +42,30 @@ message ClipboardText {
 }
 
 message Ping {}
+
+/// 文件传输模式。RELAY 表示通过服务端中继下载，P2P 为未来 P2P 直连预留。
+enum TransferMode {
+  RELAY = 0;
+  P2P = 1;
+}
+
+/// 服务端通过 gRPC 流向 PC 客户端推送文件接收通知。
+///
+/// `file_access_token` 为 32 字节安全随机令牌（bytes 类型），客户端构造
+/// HTTP 请求时须将其转换为 lowercase hex 字符串（64 字符），放入
+/// `Authorization: Bearer` 头；不得编码进 URL。
+message FileReceived {
+  string file_id = 1;
+  string file_name = 2;
+  string mime_type = 3;
+  int64 size_bytes = 4;
+  string download_url = 5;
+  string sha256 = 6;
+  TransferMode transfer_mode = 7;
+  // 文件级访问令牌，32 字节原始数据，通过 gRPC TLS 通道下发。
+  // 客户端 HTTP 请求时转为 lowercase hex 字符串填入 Authorization: Bearer 头。
+  bytes file_access_token = 8;
+}
 
 message PingRequest {
   string grpc_session_token = 1;

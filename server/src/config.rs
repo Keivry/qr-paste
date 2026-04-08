@@ -3,7 +3,7 @@
 use {
     ipnet::IpNet,
     serde::Deserialize,
-    std::{fmt, fs, net::IpAddr, sync::Arc},
+    std::{fmt, fs, net::IpAddr, path::PathBuf, sync::Arc},
     url::{Host, Url},
 };
 
@@ -153,6 +153,33 @@ pub struct ServerConfig {
     /// 设为空字符串时禁用持久化（重启后所有配对信息丢失）。
     #[serde(default = "default_persistence_path")]
     pub persistence_path: String,
+    /// 【必填】文件上传临时目录路径（绝对路径）。服务端启动时若目录不存在会自动创建。
+    /// 未配置时服务端启动 fatal 退出。建议使用独立分区或配置磁盘配额限制。
+    pub upload_dir: PathBuf,
+    /// 单文件上传大小上限（字节）。默认 52428800（50 MB）。超出返回 HTTP 413。
+    #[serde(default = "default_max_upload_size_bytes")]
+    pub max_upload_size_bytes: u64,
+    /// 上传文件保留时间（秒）。超过此时间未被 ACK 的文件由后台任务删除。默认 3600。
+    #[serde(default = "default_upload_file_retention_secs")]
+    pub upload_file_retention_secs: u64,
+    /// 上传文件清理任务执行间隔（秒）。默认 300。
+    #[serde(default = "default_upload_cleanup_interval_secs")]
+    pub upload_cleanup_interval_secs: u64,
+    /// 每 IP 每分钟允许的最大上传请求次数。默认 6。超出返回 HTTP 429。
+    #[serde(default = "default_upload_rate_limit_per_ip_per_min")]
+    pub upload_rate_limit_per_ip_per_min: u32,
+    /// 上传 body 接收超时（秒）。服务端自身强制，不依赖反向代理。默认 30。超时返回 HTTP 408。
+    #[serde(default = "default_upload_body_timeout_secs")]
+    pub upload_body_timeout_secs: u64,
+    /// 单 pairing 内最大 pending 文件数（含 Uploading 状态）。默认 20。超出返回 HTTP 429。
+    #[serde(default = "default_max_pending_upload_files_per_pairing")]
+    pub max_pending_upload_files_per_pairing: u32,
+    /// 全局所有 pairing 内最大 pending 文件总数。默认 500。超出返回 HTTP 429。
+    #[serde(default = "default_max_pending_upload_files_global")]
+    pub max_pending_upload_files_global: u32,
+    /// 全局 pending 文件总字节数硬上限。默认 2147483648（2 GB）。超出返回 HTTP 429。
+    #[serde(default = "default_max_pending_upload_bytes_global")]
+    pub max_pending_upload_bytes_global: u64,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -192,6 +219,33 @@ impl fmt::Debug for ServerConfig {
             .field("log_level", &self.log_level)
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .field("persistence_path", &self.persistence_path)
+            .field("upload_dir", &self.upload_dir)
+            .field("max_upload_size_bytes", &self.max_upload_size_bytes)
+            .field(
+                "upload_file_retention_secs",
+                &self.upload_file_retention_secs,
+            )
+            .field(
+                "upload_cleanup_interval_secs",
+                &self.upload_cleanup_interval_secs,
+            )
+            .field(
+                "upload_rate_limit_per_ip_per_min",
+                &self.upload_rate_limit_per_ip_per_min,
+            )
+            .field("upload_body_timeout_secs", &self.upload_body_timeout_secs)
+            .field(
+                "max_pending_upload_files_per_pairing",
+                &self.max_pending_upload_files_per_pairing,
+            )
+            .field(
+                "max_pending_upload_files_global",
+                &self.max_pending_upload_files_global,
+            )
+            .field(
+                "max_pending_upload_bytes_global",
+                &self.max_pending_upload_bytes_global,
+            )
             .finish()
     }
 }
@@ -211,6 +265,14 @@ fn default_grpc_keepalive_interval_secs() -> u64 { 60 }
 fn default_grpc_keepalive_timeout_secs() -> u64 { 20 }
 fn default_log_level() -> String { "info".to_string() }
 fn default_persistence_path() -> String { "qr-paste-state.db".to_string() }
+fn default_max_upload_size_bytes() -> u64 { 52_428_800 }
+fn default_upload_file_retention_secs() -> u64 { 3600 }
+fn default_upload_cleanup_interval_secs() -> u64 { 300 }
+fn default_upload_rate_limit_per_ip_per_min() -> u32 { 6 }
+fn default_upload_body_timeout_secs() -> u64 { 30 }
+fn default_max_pending_upload_files_per_pairing() -> u32 { 20 }
+fn default_max_pending_upload_files_global() -> u32 { 500 }
+fn default_max_pending_upload_bytes_global() -> u64 { 2_147_483_648 }
 
 impl ServerConfig {
     /// 从当前工作目录下的 `server.toml` 加载配置。
@@ -265,6 +327,33 @@ impl ServerConfig {
             anyhow::bail!("ws_idle_timeout_secs 必须大于 0");
         }
         let _ = self.trusted_proxy_ranges()?;
+        if self.upload_dir.as_os_str().is_empty() {
+            anyhow::bail!("server.toml 中必须填写 upload_dir");
+        }
+        if self.max_upload_size_bytes == 0 {
+            anyhow::bail!("max_upload_size_bytes 必须大于 0");
+        }
+        if self.upload_file_retention_secs == 0 {
+            anyhow::bail!("upload_file_retention_secs 必须大于 0");
+        }
+        if self.upload_cleanup_interval_secs == 0 {
+            anyhow::bail!("upload_cleanup_interval_secs 必须大于 0");
+        }
+        if self.upload_rate_limit_per_ip_per_min == 0 {
+            anyhow::bail!("upload_rate_limit_per_ip_per_min 必须大于 0");
+        }
+        if self.upload_body_timeout_secs == 0 {
+            anyhow::bail!("upload_body_timeout_secs 必须大于 0");
+        }
+        if self.max_pending_upload_files_per_pairing == 0 {
+            anyhow::bail!("max_pending_upload_files_per_pairing 必须大于 0");
+        }
+        if self.max_pending_upload_files_global == 0 {
+            anyhow::bail!("max_pending_upload_files_global 必须大于 0");
+        }
+        if self.max_pending_upload_bytes_global == 0 {
+            anyhow::bail!("max_pending_upload_bytes_global 必须大于 0");
+        }
         Ok(())
     }
 

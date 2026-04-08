@@ -3,7 +3,12 @@
 //! 配对状态管理：配对条目、浏览器会话、WebSocket 票据及其存储的创建、验证与清理。
 
 use {
-    crate::{config::ServerConfig, persist::PersistenceStore, session::SessionStore},
+    crate::{
+        config::ServerConfig,
+        persist::PersistenceStore,
+        session::SessionStore,
+        upload_store::UploadStore,
+    },
     dashmap::DashMap,
     rand::RngExt,
     regex::Regex,
@@ -226,6 +231,7 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, ()> {
 /// 已过期的会话令牌、离线且过期的配对条目，以及对应的浏览器会话和 WS 票据。
 ///
 /// 收到 `cancellation` 信号后退出。
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_cleanup_task(
     config: Arc<ServerConfig>,
     session_store: SessionStore,
@@ -234,6 +240,7 @@ pub fn spawn_cleanup_task(
     ws_ticket_store: WsTicketStore,
     cancellation: CancellationToken,
     persist: Option<Arc<PersistenceStore>>,
+    upload_store: Arc<UploadStore>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(
@@ -249,6 +256,7 @@ pub fn spawn_cleanup_task(
                         &browser_session_store,
                         &ws_ticket_store,
                         persist.as_deref(),
+                        &upload_store,
                     );
                     if let Some(p) = &persist {
                         p.delete_expired();
@@ -300,6 +308,7 @@ fn cleanup_pairings(
     browser_session_store: &BrowserSessionStore,
     ws_ticket_store: &WsTicketStore,
     persist: Option<&PersistenceStore>,
+    upload_store: &UploadStore,
 ) {
     let now = Instant::now();
     let mut removed_pairings = HashSet::new();
@@ -332,6 +341,9 @@ fn cleanup_pairings(
     if !removed_pairings.is_empty() {
         browser_session_store.retain(|_, session| !removed_pairings.contains(&session.pairing_id));
         ws_ticket_store.retain(|_, ticket| !removed_pairings.contains(&ticket.pairing_id));
+        for pairing_id in &removed_pairings {
+            upload_store.cleanup_pairing(*pairing_id);
+        }
     }
 
     browser_session_store.retain(|_, session| {
@@ -353,7 +365,10 @@ mod tests {
             new_pairing_store,
             new_ws_ticket_store,
         },
-        crate::session::{Session, new_store},
+        crate::{
+            session::{Session, new_store},
+            upload_store::new_upload_store,
+        },
         std::time::{Duration, Instant},
         tokio::sync::mpsc,
         uuid::Uuid,
@@ -434,6 +449,7 @@ mod tests {
             &browser_session_store,
             &ws_ticket_store,
             None,
+            &new_upload_store(52428800, 20, 500, 2147483648),
         );
 
         assert!(pairing_store.contains_key(&pairing_id));

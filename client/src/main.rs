@@ -7,6 +7,7 @@
 
 mod clipboard;
 mod config;
+mod file_handler;
 mod grpc;
 mod icon;
 mod tray;

@@ -62,6 +62,8 @@ pub enum ClientEvent {
     MobileDisconnected,
     /// 手机端发送了剪贴板文本内容。
     ClipboardText { content: String },
+    /// 服务端通知 PC 客户端有文件可供下载。
+    FileReceived(relay::FileReceived),
     /// gRPC 连接发生不可恢复的错误。
     Error { message: String },
 }
@@ -429,6 +431,7 @@ fn map_server_event(event: Event) -> Option<ClientEvent> {
         Event::MobileDisconnected(_) => Some(ClientEvent::MobileDisconnected),
         Event::ClipboardText(c) => Some(ClientEvent::ClipboardText { content: c.content }),
         Event::Ping(_) => None,
+        Event::FileReceived(f) => Some(ClientEvent::FileReceived(f)),
     }
 }
 

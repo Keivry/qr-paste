@@ -5,10 +5,12 @@ use {
         config::{ServerConfig, TrustedProxyCidrs},
         grpc::relay::{
             ClipboardText,
+            FileReceived,
             MobileConnected,
             MobileDisconnected,
             ServerEvent,
             SessionToken,
+            TransferMode,
             server_event::Event,
         },
         pairing::{
@@ -27,6 +29,7 @@ use {
         },
         persist::PersistenceStore,
         session::{SessionStore, latest_session_token},
+        upload_store::{SaveFileError, UploadLimitError, UploadStore},
     },
     axum::{
         Json,
@@ -34,6 +37,8 @@ use {
         body::Bytes,
         extract::{
             ConnectInfo,
+            DefaultBodyLimit,
+            Multipart,
             Path,
             State,
             ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
@@ -46,7 +51,9 @@ use {
             header::{
                 AUTHORIZATION,
                 CACHE_CONTROL,
+                CONTENT_DISPOSITION,
                 CONTENT_SECURITY_POLICY,
+                CONTENT_TYPE,
                 COOKIE,
                 ORIGIN,
                 REFERRER_POLICY,
@@ -132,6 +139,8 @@ pub struct AppState {
     pub revoke_session_limiter: KeyedLimiter<String>,
     /// 持久化存储句柄，为 `None` 时禁用持久化。
     pub persist: Option<Arc<PersistenceStore>>,
+    /// 文件上传临时存储，管理上传文件的内存索引与全局并发计数器。
+    pub upload_store: Arc<UploadStore>,
 }
 
 #[derive(Deserialize)]
@@ -166,6 +175,7 @@ impl KeyExtractor for TrustedClientIpKeyExtractor {
 }
 
 /// 绑定 HTTP 监听地址并运行 Axum 路由服务。
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     addr: SocketAddr,
     store: SessionStore,
@@ -174,6 +184,7 @@ pub async fn serve(
     ws_ticket_store: WsTicketStore,
     config: ServerConfig,
     persist: Option<Arc<PersistenceStore>>,
+    upload_store: Arc<UploadStore>,
 ) -> anyhow::Result<()> {
     let trusted_proxies = config.trusted_proxy_ranges()?;
     serve_inner(
@@ -185,6 +196,7 @@ pub async fn serve(
         config,
         TrustedClientIpKeyExtractor::new(trusted_proxies),
         persist,
+        upload_store,
     )
     .await
 }
@@ -200,6 +212,7 @@ async fn serve_inner<K>(
     config: ServerConfig,
     key_extractor: K,
     persist: Option<Arc<PersistenceStore>>,
+    upload_store: Arc<UploadStore>,
 ) -> anyhow::Result<()>
 where
     K: tower_governor::key_extractor::KeyExtractor + Clone + Send + Sync + 'static,
@@ -218,6 +231,7 @@ where
         revoke_pairing_limiter: keyed_limiter(5),
         revoke_session_limiter: keyed_limiter(10),
         persist,
+        upload_store,
     };
 
     let http_rate = config.http_rate_limit_per_ip_per_min;
@@ -274,10 +288,21 @@ where
             .period(Duration::from_secs(60))
             .burst_size(ws_rate)
             .methods(vec![Method::GET])
-            .key_extractor(key_extractor)
+            .key_extractor(key_extractor.clone())
             .finish()
             .ok_or_else(|| anyhow::anyhow!("invalid ws governor config"))?,
     );
+    let upload_rate = config.upload_rate_limit_per_ip_per_min;
+    let upload_limit = Arc::new(
+        GovernorConfigBuilder::default()
+            .period(Duration::from_secs(60))
+            .burst_size(upload_rate)
+            .methods(vec![Method::POST])
+            .key_extractor(key_extractor)
+            .finish()
+            .ok_or_else(|| anyhow::anyhow!("invalid upload governor config"))?,
+    );
+    let max_upload_size = config.max_upload_size_bytes;
 
     let router = Router::new()
         .route(
@@ -307,6 +332,21 @@ where
         .route(
             "/ws/mobile/{id}",
             get(handle_ws_upgrade).layer(GovernorLayer::new(ws_limit)),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    "/api/pairing/{pairing_id}/upload",
+                    post(handle_upload).layer(GovernorLayer::new(upload_limit)),
+                )
+                .layer(DefaultBodyLimit::max(
+                    (max_upload_size as usize).saturating_add(8192),
+                )),
+        )
+        .route("/api/files/{file_id}", get(handle_file_download))
+        .route(
+            "/api/files/{file_id}/ack",
+            post(handle_file_ack).layer(GovernorLayer::new(status_limit)),
         )
         .with_state(state);
 
@@ -740,6 +780,250 @@ async fn handle_revoke(
     }
 
     let mut response = Json(json!({ "pairing_epoch": epoch })).into_response();
+    apply_common_headers(response.headers_mut());
+    response
+}
+
+/// 处理手机端文件上传（`POST /api/pairing/{pairing_id}/upload`）。
+///
+/// 验证浏览器会话后，将 multipart 文件存入 upload_store，并通过 gRPC 推送通知 PC 客户端。
+/// 响应包含 file_id、file_name、mime_type、size_bytes、sha256。
+async fn handle_upload(
+    Path(pairing_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> Response {
+    if let Err(status) = require_browser_origin(&state, &headers) {
+        return error_json(status, "forbidden");
+    }
+    let Ok(pairing_id) = Uuid::parse_str(&pairing_id) else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid_pairing_id");
+    };
+    let auth = match authenticate_browser_session(&state, pairing_id, &headers) {
+        Ok(auth) => auth,
+        Err(StatusCode::UNAUTHORIZED) => return reauth_required_response(),
+        Err(StatusCode::NOT_FOUND) => return pairing_not_found_response(),
+        Err(other) => return error_json(other, "unauthorized"),
+    };
+    let _ = auth;
+
+    let upload_dir = state.config.upload_dir.clone();
+    let max_upload_size = state.config.max_upload_size_bytes;
+    let body_timeout = Duration::from_secs(state.config.upload_body_timeout_secs);
+
+    let save_result = state
+        .upload_store
+        .save_file(
+            &upload_dir,
+            pairing_id,
+            multipart,
+            max_upload_size,
+            body_timeout,
+        )
+        .await;
+
+    let (file_id, meta) = match save_result {
+        Err(SaveFileError::Timeout) => {
+            return error_json(StatusCode::REQUEST_TIMEOUT, "upload_timeout");
+        }
+        Err(SaveFileError::TooLarge) => {
+            return error_json(StatusCode::PAYLOAD_TOO_LARGE, "file_too_large");
+        }
+        Err(SaveFileError::NoFileField) => {
+            return error_json(StatusCode::UNPROCESSABLE_ENTITY, "no_file_field");
+        }
+        Err(SaveFileError::TooManyFields) => {
+            return error_json(StatusCode::UNPROCESSABLE_ENTITY, "too_many_fields");
+        }
+        Err(SaveFileError::Limit(limit_err)) => {
+            let msg = match limit_err {
+                UploadLimitError::PerPairingFileLimitReached => "per_pairing_file_limit",
+                UploadLimitError::GlobalFileLimitReached => "global_file_limit",
+                UploadLimitError::GlobalByteLimitReached => "global_byte_limit",
+                UploadLimitError::PairingClosed => "pairing_closed",
+            };
+            return error_json(StatusCode::TOO_MANY_REQUESTS, msg);
+        }
+        Err(SaveFileError::Io(err)) => {
+            warn!("上传文件 IO 错误 pairing_id={pairing_id}: {err}");
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        }
+        Ok(result) => result,
+    };
+
+    // 三步并发安全 gRPC 推送
+    if state.upload_store.begin_notifying(file_id, pairing_id) {
+        let download_url = format!(
+            "{}/api/files/{file_id}",
+            state.config.public_base_url.trim_end_matches('/')
+        );
+        let event = ServerEvent {
+            event: Some(Event::FileReceived(FileReceived {
+                file_id: file_id.to_string(),
+                file_name: meta.file_name.clone(),
+                mime_type: meta.mime_type.clone(),
+                size_bytes: meta.size_bytes as i64,
+                download_url,
+                sha256: meta.sha256.clone(),
+                transfer_mode: TransferMode::Relay as i32,
+                file_access_token: meta.file_access_token.to_vec(),
+            })),
+            grpc_session_token: String::new(),
+        };
+        let client_tx = current_client_tx(&state.store, &state.pairing_store, pairing_id);
+        if let Some(tx) = client_tx {
+            match tx.send(Ok(event)).await {
+                Ok(()) => state.upload_store.mark_notified(file_id),
+                Err(_) => {
+                    let store = state.upload_store.clone();
+                    tokio::spawn(async move {
+                        store.mark_notify_failed(file_id);
+                    });
+                    warn!(
+                        "gRPC 推送失败（接收端已关闭） file_id={file_id} pairing_id={pairing_id}"
+                    );
+                }
+            }
+        } else {
+            // 无活跃 gRPC 订阅，仅记录日志，文件保留等待下次推送机会
+            warn!("上传完成但无活跃 gRPC 订阅 file_id={file_id} pairing_id={pairing_id}");
+            state.upload_store.mark_notify_failed(file_id);
+        }
+    }
+
+    let mut response = Json(json!({
+        "file_id": file_id.to_string(),
+        "file_name": meta.raw_filename,
+        "mime_type": meta.mime_type,
+        "size_bytes": meta.size_bytes,
+        "sha256": meta.sha256,
+    }))
+    .into_response();
+    apply_common_headers(response.headers_mut());
+    response
+}
+
+/// 处理文件下载（`GET /api/files/{file_id}`）。
+///
+/// 客户端（PC）通过 Bearer token（file_access_token 的十六进制）进行常量时间验证后，
+/// 流式返回文件内容，并携带 RFC5987 编码的 Content-Disposition 头。
+async fn handle_file_download(
+    Path(file_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(file_id) = Uuid::parse_str(&file_id) else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid_file_id");
+    };
+
+    let Some(token_hex) = bearer_token(&headers) else {
+        return error_json(StatusCode::NOT_FOUND, "file_not_found");
+    };
+    let Ok(provided_token) = decode_hex_32(&token_hex) else {
+        return error_json(StatusCode::NOT_FOUND, "file_not_found");
+    };
+
+    let Some(meta) = state.upload_store.get_file_meta(file_id) else {
+        return error_json(StatusCode::NOT_FOUND, "file_not_found");
+    };
+    if provided_token.ct_ne(&meta.file_access_token).into() {
+        return error_json(StatusCode::NOT_FOUND, "file_not_found");
+    }
+
+    let file = match tokio::fs::File::open(&meta.file_path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return error_json(StatusCode::NOT_FOUND, "file_not_found");
+        }
+        Err(e) => {
+            warn!("打开文件失败 file_id={file_id}: {e}");
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        }
+    };
+
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = axum::body::Body::from_stream(stream);
+
+    // RFC5987 编码的 Content-Disposition，兼容非 ASCII 文件名
+    let filename_escaped = meta
+        .file_name
+        .chars()
+        .flat_map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') {
+                vec![c]
+            } else {
+                let mut buf = [0u8; 4];
+                let encoded = c.encode_utf8(&mut buf);
+                encoded
+                    .bytes()
+                    .flat_map(|b| {
+                        let hi = "0123456789ABCDEF".as_bytes()[usize::from(b >> 4)];
+                        let lo = "0123456789ABCDEF".as_bytes()[usize::from(b & 0x0f)];
+                        vec!['%', hi as char, lo as char]
+                    })
+                    .collect::<Vec<_>>()
+            }
+        })
+        .collect::<String>();
+    let content_disposition = format!("attachment; filename*=UTF-8''{filename_escaped}");
+    let Ok(cd_value) = HeaderValue::from_str(&content_disposition) else {
+        return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    };
+    let Ok(ct_value) = HeaderValue::from_str(&meta.mime_type) else {
+        return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    };
+
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(CONTENT_DISPOSITION, cd_value);
+    response.headers_mut().insert(CONTENT_TYPE, ct_value);
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+    response
+}
+
+#[derive(Deserialize)]
+struct AckBody {
+    #[allow(dead_code)]
+    success: bool,
+}
+
+/// 处理 PC 客户端对文件接收的 ACK（`POST /api/files/{file_id}/ack`）。
+///
+/// 解析 `{"success": bool}` 后调用 `remove_file()`，不存在时直接 200（幂等）。
+async fn handle_file_ack(
+    Path(file_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if body.len() > 256 {
+        return error_json(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large");
+    }
+    let Ok(file_id) = Uuid::parse_str(&file_id) else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid_file_id");
+    };
+
+    let Some(token_hex) = bearer_token(&headers) else {
+        return error_json(StatusCode::NOT_FOUND, "file_not_found");
+    };
+    let Ok(provided_token) = decode_hex_32(&token_hex) else {
+        return error_json(StatusCode::NOT_FOUND, "file_not_found");
+    };
+
+    if let Some(meta) = state.upload_store.get_file_meta(file_id) {
+        if provided_token.ct_ne(&meta.file_access_token).into() {
+            return error_json(StatusCode::NOT_FOUND, "file_not_found");
+        }
+        let _ack: AckBody = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid_format"),
+        };
+        state.upload_store.remove_file(file_id);
+    }
+
+    let mut response = Json(json!({"ok": true})).into_response();
     apply_common_headers(response.headers_mut());
     response
 }

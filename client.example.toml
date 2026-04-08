@@ -64,3 +64,12 @@ notification_duration_secs = 3
 # 仅在 auto_paste = true 时生效；粘贴后尽力还原为原始文本；
 # 若原始内容为非文本（图片等）或读取失败，还原步骤将静默跳过；此功能属最佳努力
 # delete_clipboard_after_paste = false
+
+# 接收到文件时的保存目录；不设置或留空则不启用文件接收功能（忽略所有 FileReceived 事件）
+# 路径支持 ~ 前缀，会自动展开为用户主目录
+# 示例（Windows）：file_save_dir = "C:/Users/YourName/Downloads/qr-paste"
+# 示例（Linux/macOS）：file_save_dir = "~/Downloads/qr-paste"
+# file_save_dir = "~/Downloads/qr-paste"
+
+# 文件下载请求超时（秒），默认 60
+# file_download_timeout_secs = 60
