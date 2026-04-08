@@ -48,7 +48,7 @@ enum AppState {
 struct ClipboardJob {
     content: String,
     auto_paste: bool,
-    emulation_key_after_paste: Option<String>,
+    simulate_key_after_paste: Option<String>,
     delete_clipboard_after_paste: bool,
     paste_delay_ms: u64,
     key_after_paste_delay_ms: u64,
@@ -319,9 +319,9 @@ impl eframe::App for App {
                             if let Err(e) = self.clipboard_job_tx.try_send(ClipboardJob {
                                 content,
                                 auto_paste: self.config.auto_paste,
-                                emulation_key_after_paste: self
+                                simulate_key_after_paste: self
                                     .config
-                                    .emulation_key_after_paste
+                                    .simulate_key_after_paste
                                     .clone(),
                                 delete_clipboard_after_paste: self
                                     .config
@@ -366,6 +366,12 @@ impl eframe::App for App {
                                     image_clipboard_max_decoded_bytes: self
                                         .config
                                         .image_clipboard_max_decoded_bytes,
+                                    simulate_key_after_paste: self
+                                        .config
+                                        .simulate_key_after_paste
+                                        .clone(),
+                                    paste_delay_ms: self.config.paste_delay_ms,
+                                    key_after_paste_delay_ms: self.config.key_after_paste_delay_ms,
                                 };
                                 if tx.try_send(job).is_err() {
                                     tracing::warn!("文件任务队列已满，本次文件已丢弃");
@@ -530,7 +536,7 @@ fn start_clipboard_worker(
 
             if job.auto_paste {
                 clipboard::simulate_paste(job.paste_delay_ms);
-                if let Some(key_spec) = &job.emulation_key_after_paste
+                if let Some(key_spec) = &job.simulate_key_after_paste
                     && let Some((modifier, key)) = clipboard::parse_key_spec(key_spec)
                 {
                     clipboard::simulate_key(modifier, key, job.key_after_paste_delay_ms);
@@ -539,7 +545,7 @@ fn start_clipboard_worker(
 
             let notice = build_clipboard_notice(
                 job.auto_paste,
-                job.emulation_key_after_paste.as_deref(),
+                job.simulate_key_after_paste.as_deref(),
                 &job.notice_content,
             );
             let _ = clipboard_notice_tx.send(notice);
@@ -559,11 +565,11 @@ fn start_clipboard_worker(
 
 fn build_clipboard_notice(
     auto_paste: bool,
-    emulation_key_after_paste: Option<&str>,
+    simulate_key_after_paste: Option<&str>,
     notice_content: &str,
 ) -> String {
     if auto_paste {
-        if let Some(key_spec) = emulation_key_after_paste {
+        if let Some(key_spec) = simulate_key_after_paste {
             format!("已自动粘贴（{key_spec}）：{notice_content}")
         } else {
             format!("已自动粘贴：{notice_content}")

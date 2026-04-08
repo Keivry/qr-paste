@@ -25,6 +25,9 @@ pub struct FileJob {
     pub auto_paste: bool,
     pub mime_type: String,
     pub image_clipboard_max_decoded_bytes: u64,
+    pub simulate_key_after_paste: Option<String>,
+    pub paste_delay_ms: u64,
+    pub key_after_paste_delay_ms: u64,
 }
 
 pub fn start_file_worker(
@@ -80,6 +83,9 @@ fn process_file_job(job: FileJob) -> String {
                     &job.auto_paste,
                     &job.mime_type,
                     job.image_clipboard_max_decoded_bytes,
+                    &job.simulate_key_after_paste,
+                    job.paste_delay_ms,
+                    job.key_after_paste_delay_ms,
                 );
                 process_file_save_job(&job, &client, &bearer, &dest_path, &file_name)
             }
@@ -144,6 +150,8 @@ fn process_image_job(
     let (tmp_path, total_bytes) =
         try_download_to_tmp(client, &job.event, bearer, &job.file_save_dir)?;
 
+    // 先用 into_dimensions() 做廉价的尺寸预检（只读文件头，无需完整解码），
+    // 通过后再 decode；两步共用同一次 open，避免重复打开文件。
     let reader = match open_image_reader(&tmp_path) {
         Ok(reader) => reader,
         Err(err) => {
@@ -192,6 +200,7 @@ fn process_image_job(
         return persist_tmp_as_saved_file(&tmp_path, dest_path, file_name, total_bytes);
     }
 
+    // 尺寸检查通过后，重新 open 并完整解码（into_dimensions 已消费了 reader）
     let image = match open_image_reader(&tmp_path)
         .and_then(|reader| reader.decode().map_err(|err| err.to_string()))
     {
@@ -223,8 +232,18 @@ fn process_image_job(
                 size = total_bytes,
                 "图片已写入剪贴板并准备自动粘贴"
             );
-            clipboard::simulate_paste(0);
-            Ok(format!("已自动粘贴图片：{file_name}"))
+            clipboard::simulate_paste(job.paste_delay_ms);
+            if let Some(key_spec) = &job.simulate_key_after_paste
+                && let Some((modifier, key)) = clipboard::parse_key_spec(key_spec)
+            {
+                clipboard::simulate_key(modifier, key, job.key_after_paste_delay_ms);
+            }
+            let notice = if let Some(key_spec) = &job.simulate_key_after_paste {
+                format!("已自动粘贴图片（{key_spec}）：{file_name}")
+            } else {
+                format!("已自动粘贴图片：{file_name}")
+            };
+            Ok(notice)
         }
         Err(err) => {
             warn!(
@@ -550,9 +569,12 @@ fn write_image_to_clipboard_win32(img: image::DynamicImage) -> Result<(), String
         },
     };
 
-    let rgba = img.into_rgba8();
+    let mut rgba = img.into_rgba8();
     let (width, height) = rgba.dimensions();
     let header_size = 124usize;
+    for pixel in rgba.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
     let pixel_data = rgba.as_raw();
     let image_size =
         u32::try_from(pixel_data.len()).map_err(|_| "Clipboard image too large".to_string())?;
@@ -589,20 +611,14 @@ fn write_image_to_clipboard_win32(img: image::DynamicImage) -> Result<(), String
         write_u32_le(ptr, 56, 0x5769_6E20);
 
         let dst = ptr.add(header_size);
-        let src = pixel_data.as_ptr();
         let row_bytes = (width as usize).saturating_mul(4);
         for dst_row in 0..(height as usize) {
             let src_row = (height as usize) - 1 - dst_row;
-            let source = src.add(src_row * row_bytes);
-            let target = dst.add(dst_row * row_bytes);
-            for col in 0..(width as usize) {
-                let s = source.add(col * 4);
-                let t = target.add(col * 4);
-                *t.add(0) = *s.add(2);
-                *t.add(1) = *s.add(1);
-                *t.add(2) = *s.add(0);
-                *t.add(3) = *s.add(3);
-            }
+            std::ptr::copy_nonoverlapping(
+                pixel_data.as_ptr().add(src_row * row_bytes),
+                dst.add(dst_row * row_bytes),
+                row_bytes,
+            );
         }
 
         GlobalUnlock(hmem);

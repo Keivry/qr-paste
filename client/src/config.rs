@@ -33,12 +33,12 @@ pub struct ClientConfig {
     /// `auto_paste` 为 `true` 时，粘贴完成后模拟按下的按键。
     ///
     /// 格式示例：`"Return"`、`"Tab"`、`"ctrl+Return"`。`None` 表示不模拟任何按键。
-    pub emulation_key_after_paste: Option<String>,
+    pub simulate_key_after_paste: Option<String>,
     /// 自动粘贴前的等待毫秒数，给剪贴板写入操作留出时间。默认 150 ms。
     pub paste_delay_ms: u64,
-    /// 模拟附加按键（`emulation_key_after_paste`）之前的等待毫秒数。默认 50 ms。
+    /// 模拟附加按键（`simulate_key_after_paste`）之前的等待毫秒数。默认 50 ms。
     ///
-    /// 仅在 `auto_paste = true` 且配置了 `emulation_key_after_paste` 时生效。
+    /// 仅在 `auto_paste = true` 且配置了 `simulate_key_after_paste` 时生效。
     pub key_after_paste_delay_ms: u64,
     /// 还原剪贴板（`delete_clipboard_after_paste`）之前的等待毫秒数。默认 200 ms。
     ///
@@ -108,8 +108,8 @@ struct RawClientConfig {
     auto_paste: bool,
     #[serde(default = "default_enter_after_paste")]
     enter_after_paste: bool,
-    #[serde(default)]
-    emulation_key_after_paste: Option<String>,
+    #[serde(default, alias = "emulation_key_after_paste")]
+    simulate_key_after_paste: Option<String>,
     #[serde(default = "default_paste_delay_ms")]
     paste_delay_ms: u64,
     #[serde(default = "default_key_after_paste_delay_ms")]
@@ -150,7 +150,7 @@ impl From<RawClientConfig> for ClientConfig {
             grpc_port,
             pairing_id: raw.pairing_id.unwrap_or_default(),
             auto_paste: raw.auto_paste,
-            emulation_key_after_paste: raw.emulation_key_after_paste.or_else(|| {
+            simulate_key_after_paste: raw.simulate_key_after_paste.or_else(|| {
                 if raw.enter_after_paste {
                     Some("Return".to_string())
                 } else {
@@ -412,11 +412,11 @@ mod tests {
             "#,
         );
 
-        assert_eq!(cfg.emulation_key_after_paste.as_deref(), Some("Return"));
+        assert_eq!(cfg.simulate_key_after_paste.as_deref(), Some("Return"));
     }
 
     #[test]
-    fn emulation_key_after_paste_takes_precedence_over_legacy_flag() {
+    fn simulate_key_after_paste_takes_precedence_over_legacy_flag() {
         let cfg = parse(
             r#"
             server_host = "relay.example.com"
@@ -427,7 +427,7 @@ mod tests {
             "#,
         );
 
-        assert_eq!(cfg.emulation_key_after_paste.as_deref(), Some("Tab"));
+        assert_eq!(cfg.simulate_key_after_paste.as_deref(), Some("Tab"));
     }
 
     #[test]
