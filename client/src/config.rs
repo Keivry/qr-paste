@@ -65,7 +65,7 @@ pub struct ClientConfig {
     ///
     /// 断线后客户端将按指数退避策略尝试重连，间隔上限由此字段控制。
     pub reconnect_max_interval_secs: u64,
-    /// 接收到文件时的保存目录。`None` 表示不启用文件接收功能（忽略所有 FileReceived 事件）。
+    /// 接收到文件时的保存目录。`None` 时由 UI 层解析 `%USERPROFILE%\Downloads` 作为默认目录。
     ///
     /// 路径可包含 `~` 前缀，客户端启动时会自动展开为用户主目录。
     pub file_save_dir: Option<std::path::PathBuf>,
@@ -128,7 +128,7 @@ struct RawClientConfig {
     reconnect_max_interval_secs: u64,
     #[serde(default)]
     delete_clipboard_after_paste: bool,
-    #[serde(default)]
+    #[serde(default, alias = "file_saved_path")]
     file_save_dir: Option<String>,
     #[serde(default = "default_file_download_timeout_secs")]
     file_download_timeout_secs: u64,

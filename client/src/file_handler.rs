@@ -394,7 +394,8 @@ fn sanitize_file_name_for_save(name: &str) -> String {
             }
         })
         .collect();
-    let cleaned = cleaned.trim_matches('.').trim();
+    let cleaned = cleaned.trim_end_matches(char::is_whitespace);
+    let cleaned = cleaned.trim_end_matches('.');
     if cleaned.is_empty() {
         "file".to_string()
     } else {
@@ -493,9 +494,9 @@ fn unique_dest_path(dir: &Path, file_name: &str) -> PathBuf {
     let (stem, ext) = split_stem_ext(file_name);
     for i in 1u32..=9999 {
         let new_name = if ext.is_empty() {
-            format!("{stem} ({i})")
+            format!("{stem}({i})")
         } else {
-            format!("{stem} ({i}).{ext}")
+            format!("{stem}({i}).{ext}")
         };
         let candidate = dir.join(&new_name);
         if !candidate.exists() {
@@ -576,7 +577,7 @@ fn write_image_to_clipboard_win32(img: image::DynamicImage) -> Result<(), String
 
         write_u32_le(ptr, 0, 124);
         write_u32_le(ptr, 4, width);
-        write_i32_le(ptr, 8, -(height as i32));
+        write_i32_le(ptr, 8, height as i32);
         write_u16_le(ptr, 12, 1);
         write_u16_le(ptr, 14, 32);
         write_u32_le(ptr, 16, 3);
@@ -589,13 +590,19 @@ fn write_image_to_clipboard_win32(img: image::DynamicImage) -> Result<(), String
 
         let dst = ptr.add(header_size);
         let src = pixel_data.as_ptr();
-        for index in 0..(width as usize).saturating_mul(height as usize) {
-            let source = src.add(index * 4);
-            let target = dst.add(index * 4);
-            *target.add(0) = *source.add(2);
-            *target.add(1) = *source.add(1);
-            *target.add(2) = *source.add(0);
-            *target.add(3) = *source.add(3);
+        let row_bytes = (width as usize).saturating_mul(4);
+        for dst_row in 0..(height as usize) {
+            let src_row = (height as usize) - 1 - dst_row;
+            let source = src.add(src_row * row_bytes);
+            let target = dst.add(dst_row * row_bytes);
+            for col in 0..(width as usize) {
+                let s = source.add(col * 4);
+                let t = target.add(col * 4);
+                *t.add(0) = *s.add(2);
+                *t.add(1) = *s.add(1);
+                *t.add(2) = *s.add(0);
+                *t.add(3) = *s.add(3);
+            }
         }
 
         GlobalUnlock(hmem);
@@ -611,7 +618,7 @@ fn write_image_to_clipboard_win32(img: image::DynamicImage) -> Result<(), String
                 return Err("EmptyClipboard failed".to_string());
             }
 
-            if SetClipboardData(CF_DIBV5, hmem.cast()).is_null() {
+            if SetClipboardData(CF_DIBV5.into(), hmem.cast()).is_null() {
                 GlobalFree(hmem);
                 return Err("SetClipboardData failed".to_string());
             }

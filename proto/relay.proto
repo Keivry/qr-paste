@@ -58,7 +58,7 @@ message FileReceived {
   string file_id = 1;
   string file_name = 2;
   string mime_type = 3;
-  int64 size_bytes = 4;
+  uint64 size_bytes = 4;
   string download_url = 5;
   string sha256 = 6;
   TransferMode transfer_mode = 7;

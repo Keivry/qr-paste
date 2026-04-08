@@ -480,7 +480,11 @@ mod tests {
     const VALID_GRPC_AUTH_TOKEN: &str = "shared-secret-xx";
     const ANOTHER_VALID_GRPC_AUTH_TOKEN: &str = "another-secret-yy";
 
-    fn parse(toml: &str) -> ServerConfig { toml::from_str(toml).expect("parse failed") }
+    fn parse(toml: &str) -> ServerConfig {
+        // upload_dir 是必填字段，测试中统一注入占位路径，避免每个 fixture 重复填写
+        let with_upload_dir = format!("{toml}\nupload_dir = \"/tmp/qr-paste-test-uploads\"");
+        toml::from_str(&with_upload_dir).expect("parse failed")
+    }
 
     #[test]
     fn load_requires_public_base_url() {

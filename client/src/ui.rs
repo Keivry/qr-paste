@@ -61,6 +61,8 @@ struct ClipboardJob {
 /// 持有配置、gRPC 事件通道、系统托盘句柄及剪贴板操作通道。
 pub struct App {
     config: ClientConfig,
+    /// 文件实际保存目录：优先取 `config.file_save_dir`，未配置时解析 `%USERPROFILE%\Downloads`。
+    effective_file_save_dir: std::path::PathBuf,
     state: AppState,
     connecting_target: Option<String>,
     last_connect_status: Option<String>,
@@ -118,15 +120,20 @@ impl App {
             cc.egui_ctx.clone(),
         );
 
-        let file_job_tx = config.file_save_dir.clone().map(|_| {
-            let (tx, rx) = mpsc::sync_channel::<FileJob>(64);
-            file_handler::start_file_worker(rx, clipboard_notice_tx.clone(), cc.egui_ctx.clone());
-            tx
-        });
+        let effective_file_save_dir = config
+            .file_save_dir
+            .clone()
+            .unwrap_or_else(resolve_default_downloads_dir);
+        tracing::info!("文件保存目录：{}", effective_file_save_dir.display());
+
+        let (tx, rx) = mpsc::sync_channel::<FileJob>(64);
+        file_handler::start_file_worker(rx, clipboard_notice_tx.clone(), cc.egui_ctx.clone());
+        let file_job_tx = Some(tx);
 
         Self {
             startup_visibility_pending: config.start_minimized,
             config,
+            effective_file_save_dir,
             state: AppState::Connecting,
             connecting_target: None,
             last_connect_status: None,
@@ -347,12 +354,10 @@ impl eframe::App for App {
                             self.state = AppState::Error { message };
                         }
                         ClientEvent::FileReceived(file) => {
-                            if let Some(ref tx) = self.file_job_tx
-                                && let Some(ref save_dir) = self.config.file_save_dir
-                            {
+                            if let Some(ref tx) = self.file_job_tx {
                                 let job = FileJob {
                                     event: file.clone(),
-                                    file_save_dir: save_dir.clone(),
+                                    file_save_dir: self.effective_file_save_dir.clone(),
                                     download_timeout_secs: self.config.file_download_timeout_secs,
                                     download_max_retries: self.config.file_download_max_retries,
                                     public_base_url: self.last_public_base_url.clone(),
@@ -642,6 +647,13 @@ fn placeholder_qr_texture(ctx: &Context) -> TextureHandle {
         color_image,
         egui::TextureOptions::LINEAR,
     )
+}
+
+fn resolve_default_downloads_dir() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("Downloads")
 }
 
 #[cfg(test)]

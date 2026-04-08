@@ -863,7 +863,7 @@ async fn handle_upload(
                 file_id: file_id.to_string(),
                 file_name: meta.file_name.clone(),
                 mime_type: meta.mime_type.clone(),
-                size_bytes: meta.size_bytes as i64,
+                size_bytes: meta.size_bytes,
                 download_url,
                 sha256: meta.sha256.clone(),
                 transfer_mode: TransferMode::Relay as i32,
