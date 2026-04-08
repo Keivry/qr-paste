@@ -4,6 +4,7 @@ use {
     crate::{
         clipboard,
         config::ClientConfig,
+        file_handler::{self, FileJob},
         grpc::{self, ClientEvent},
         tray,
     },
@@ -72,6 +73,7 @@ pub struct App {
     clipboard_job_tx: mpsc::SyncSender<ClipboardJob>,
     clipboard_notice_rx: mpsc::Receiver<String>,
     paste_notice: Option<(String, Instant)>,
+    file_job_tx: Option<mpsc::SyncSender<FileJob>>,
     last_session_token: Option<String>,
     last_grpc_session_token: Option<String>,
     last_public_base_url: Option<String>,
@@ -116,6 +118,12 @@ impl App {
             cc.egui_ctx.clone(),
         );
 
+        let file_job_tx = config.file_save_dir.clone().map(|_| {
+            let (tx, rx) = mpsc::sync_channel::<FileJob>(64);
+            file_handler::start_file_worker(rx, clipboard_notice_tx.clone(), cc.egui_ctx.clone());
+            tx
+        });
+
         Self {
             startup_visibility_pending: config.start_minimized,
             config,
@@ -129,6 +137,7 @@ impl App {
             clipboard_job_tx,
             paste_notice: None,
             clipboard_notice_rx,
+            file_job_tx,
             last_session_token: None,
             last_grpc_session_token: None,
             last_public_base_url: None,
@@ -336,6 +345,34 @@ impl eframe::App for App {
                             self.connecting_target = None;
                             self.last_connect_status = None;
                             self.state = AppState::Error { message };
+                        }
+                        ClientEvent::FileReceived(file) => {
+                            if let Some(ref tx) = self.file_job_tx
+                                && let Some(ref save_dir) = self.config.file_save_dir
+                            {
+                                let job = FileJob {
+                                    event: file.clone(),
+                                    file_save_dir: save_dir.clone(),
+                                    download_timeout_secs: self.config.file_download_timeout_secs,
+                                    download_max_retries: self.config.file_download_max_retries,
+                                    public_base_url: self.last_public_base_url.clone(),
+                                };
+                                if tx.try_send(job).is_err() {
+                                    tracing::warn!("文件任务队列已满，本次文件已丢弃");
+                                    let base_url = self.last_public_base_url.clone();
+                                    std::thread::spawn(move || {
+                                        if let Ok(client) =
+                                            reqwest::blocking::Client::builder().build()
+                                        {
+                                            file_handler::send_ack(
+                                                &client, &file, &base_url, false,
+                                            );
+                                        }
+                                    });
+                                    queued_notice =
+                                        Some("文件接收队列已满，该文件已跳过".to_string());
+                                }
+                            }
                         }
                     },
                     Err(TryRecvError::Empty) => break,

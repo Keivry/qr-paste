@@ -65,6 +65,14 @@ pub struct ClientConfig {
     ///
     /// 断线后客户端将按指数退避策略尝试重连，间隔上限由此字段控制。
     pub reconnect_max_interval_secs: u64,
+    /// 接收到文件时的保存目录。`None` 表示不启用文件接收功能（忽略所有 FileReceived 事件）。
+    ///
+    /// 路径可包含 `~` 前缀，客户端启动时会自动展开为用户主目录。
+    pub file_save_dir: Option<std::path::PathBuf>,
+    /// 文件下载请求超时（秒）。默认 60 秒。
+    pub file_download_timeout_secs: u64,
+    /// 文件下载失败时最大重试次数（瞬时错误：连接失败、超时、5xx）。默认 3 次。
+    pub file_download_max_retries: u32,
 }
 
 fn default_grpc_port() -> u16 { 50051 }
@@ -79,6 +87,8 @@ fn default_minimize_on_close() -> bool { false }
 fn default_notification_duration_secs() -> u64 { 3 }
 fn default_heartbeat_interval_secs() -> u64 { 30 }
 fn default_reconnect_max_interval_secs() -> u64 { 60 }
+fn default_file_download_timeout_secs() -> u64 { 60 }
+fn default_file_download_max_retries() -> u32 { 3 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RawClientConfig {
@@ -112,6 +122,12 @@ struct RawClientConfig {
     reconnect_max_interval_secs: u64,
     #[serde(default)]
     delete_clipboard_after_paste: bool,
+    #[serde(default)]
+    file_save_dir: Option<String>,
+    #[serde(default = "default_file_download_timeout_secs")]
+    file_download_timeout_secs: u64,
+    #[serde(default = "default_file_download_max_retries")]
+    file_download_max_retries: u32,
 }
 
 impl From<RawClientConfig> for ClientConfig {
@@ -142,6 +158,9 @@ impl From<RawClientConfig> for ClientConfig {
             delete_clipboard_after_paste: raw.delete_clipboard_after_paste,
             heartbeat_interval_secs: raw.heartbeat_interval_secs,
             reconnect_max_interval_secs: raw.reconnect_max_interval_secs,
+            file_save_dir: raw.file_save_dir.map(|s| expand_tilde_path(&s)),
+            file_download_timeout_secs: raw.file_download_timeout_secs,
+            file_download_max_retries: raw.file_download_max_retries,
         }
     }
 }
@@ -241,6 +260,25 @@ fn default_grpc_port_for_server_host(server_host: &str) -> u16 {
     } else {
         default_grpc_port()
     }
+}
+
+fn expand_tilde_path(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Some(home) = dirs_home()
+    {
+        return home.join(rest);
+    } else if s == "~"
+        && let Some(home) = dirs_home()
+    {
+        return home;
+    }
+    PathBuf::from(s)
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
 }
 
 fn resolve_config_path() -> Result<PathBuf, String> {
