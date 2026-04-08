@@ -60,13 +60,13 @@
       color: #58151c;
     }
     .input-area {
-      flex: 1;
+      flex-shrink: 0;
       display: flex;
       flex-direction: column;
       min-height: 0;
     }
     textarea {
-      flex: 1;
+      height: 120px;
       width: 100%;
       min-height: 0;
       padding: 12px;
@@ -77,10 +77,19 @@
       outline: none;
       background: #fff;
     }
+    textarea:focus {
+      border-color: #0d6efd;
+      box-shadow: 0 0 0 3px rgba(13, 110, 253, 0.15);
+      outline: none;
+    }
     .action-area {
       flex-shrink: 0;
       background: #f5f5f5;
       padding: 12px 0 max(env(safe-area-inset-bottom, 0px), 8px);
+      display: flex;
+      flex-direction: row;
+      align-items: stretch;
+      gap: 8px;
     }
     button {
       display: block;
@@ -99,44 +108,98 @@
       background: #adb5bd;
       cursor: not-allowed;
     }
-    .upload-area {
-      margin-top: 10px;
+    #add-file-btn {
+      width: 44px;
+      min-height: 44px;
+      border: 1.5px solid #0d6efd;
+      background: transparent;
+      color: #0d6efd;
+      border-radius: 8px;
+      font-size: 20px;
+      cursor: pointer;
+      flex-shrink: 0;
+      padding: 0;
     }
-    #upload-btn {
-      background: #198754;
-      font-size: 15px;
-      font-weight: 600;
-    }
-    #upload-btn:disabled {
-      background: #adb5bd;
+    #add-file-btn:disabled {
+      border-color: #adb5bd;
+      color: #adb5bd;
       cursor: not-allowed;
     }
-    #upload-status {
-      display: none;
-      margin-top: 8px;
-      padding: 8px 12px;
+    #send-btn {
+      flex: 1;
+    }
+    #file-list {
+      overflow-y: auto;
+      max-height: 180px;
+    }
+    .file-item {
+      background: #fff;
       border-radius: 6px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      position: relative;
+      overflow: hidden;
+    }
+    .file-item-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .file-item-name {
+      flex: 1;
       font-size: 13px;
-      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
-    .upload-status-uploading {
-      background: #cff4fc;
-      color: #055160;
+    .file-item-size {
+      font-size: 12px;
+      color: #6c757d;
+      white-space: nowrap;
     }
-    .upload-status-ok {
-      background: #d1e7dd;
-      color: #0a3622;
+    .file-item-remove {
+      background: none;
+      border: none;
+      cursor: pointer;
+      color: #6c757d;
+      font-size: 16px;
+      padding: 0 2px;
+      width: auto;
+      min-height: auto;
+      display: inline;
+      line-height: 1;
     }
-    .upload-status-err {
-      background: #f8d7da;
-      color: #58151c;
+    .file-item-status {
+      font-size: 12px;
+      margin-top: 4px;
+    }
+    .file-item-status-ok {
+      color: #198754;
+    }
+    .file-item-status-err {
+      color: #dc3545;
+    }
+    .file-progress-bar-wrap {
+      height: 3px;
+      background: #e9ecef;
+      border-radius: 2px;
+      margin-top: 6px;
+      overflow: hidden;
+    }
+    .file-progress-bar {
+      height: 3px;
+      border-radius: 2px;
+      transition: width 0.2s;
+      width: 0%;
+      background: #0d6efd;
     }
     #file-input {
       display: none;
     }
     @media (orientation: landscape) {
       textarea {
-        min-height: 60px;
+        height: 60px;
+        min-height: 0;
       }
     }
     </style>
@@ -147,13 +210,11 @@
       <div class="input-area">
         <textarea id="input" placeholder="输入要发送到 PC 的文本..." disabled></textarea>
       </div>
+      <div id="file-list" style="display:none; margin-bottom: 10px;"></div>
       <div class="action-area">
+        <button id="add-file-btn" type="button" disabled>+</button>
+        <input id="file-input" type="file" multiple>
         <button id="send-btn" type="button" disabled>发送</button>
-        <div class="upload-area">
-          <input id="file-input" type="file" multiple>
-          <button id="upload-btn" type="button" disabled>选择文件发送到 PC</button>
-          <div id="upload-status"></div>
-        </div>
       </div>
     </div>
 
@@ -162,9 +223,9 @@
     const statusEl = document.getElementById("status")
     const inputEl = document.getElementById("input")
     const sendBtn = document.getElementById("send-btn")
-    const uploadBtn = document.getElementById("upload-btn")
+    const addFileBtn = document.getElementById("add-file-btn")
     const fileInput = document.getElementById("file-input")
-    const uploadStatus = document.getElementById("upload-status")
+    const fileListEl = document.getElementById("file-list")
     const wsProto = location.protocol === "https:" ? "wss" : "ws"
 
     const initialHash = window.location.hash
@@ -186,6 +247,9 @@
     let actionMode = "send"
     let uploadInProgress = false
 
+    let selectedFiles = []
+    let nextFileId = 1
+
     function setStatus(text, cls) {
       statusEl.textContent = text
       statusEl.className = `status-${cls}`
@@ -198,22 +262,74 @@
         return
       }
       sendBtn.textContent = "发送"
-      sendBtn.disabled = inputEl.disabled || inputEl.value.trim() === ""
+      const hasText = inputEl.value.trim() !== ""
+      const hasFiles = selectedFiles.length > 0
+      sendBtn.disabled = inputEl.disabled || (!hasText && !hasFiles) || uploadInProgress
     }
 
     function updateUploadButton(connected) {
-      uploadBtn.disabled = !connected || uploadInProgress
+      addFileBtn.disabled = !connected || uploadInProgress
     }
 
-    function setUploadStatus(text, cls) {
-      if (!text) {
-        uploadStatus.style.display = "none"
-        uploadStatus.textContent = ""
+    function renderFileList() {
+      fileListEl.innerHTML = ""
+      if (selectedFiles.length === 0) {
+        fileListEl.style.display = "none"
+        updateSendButton()
         return
       }
-      uploadStatus.textContent = text
-      uploadStatus.className = `upload-status-${cls}`
-      uploadStatus.style.display = "block"
+      fileListEl.style.display = "block"
+
+      for (const entry of selectedFiles) {
+        const itemEl = document.createElement("div")
+        itemEl.className = "file-item"
+
+        const headerEl = document.createElement("div")
+        headerEl.className = "file-item-header"
+
+        const nameEl = document.createElement("div")
+        nameEl.className = "file-item-name"
+        nameEl.textContent = entry.file.name
+
+        const sizeEl = document.createElement("div")
+        sizeEl.className = "file-item-size"
+        const sizeKb = (entry.file.size / 1024).toFixed(1)
+        sizeEl.textContent = sizeKb > 1024 ? (sizeKb / 1024).toFixed(1) + " MB" : sizeKb + " KB"
+
+        const removeBtn = document.createElement("button")
+        removeBtn.className = "file-item-remove"
+        removeBtn.textContent = "×"
+        removeBtn.disabled = uploadInProgress
+        removeBtn.onclick = () => {
+          if (uploadInProgress) return
+          selectedFiles = selectedFiles.filter((f) => f.id !== entry.id)
+          renderFileList()
+        }
+
+        headerEl.appendChild(nameEl)
+        headerEl.appendChild(sizeEl)
+        headerEl.appendChild(removeBtn)
+        itemEl.appendChild(headerEl)
+
+        const statusEl = document.createElement("div")
+        statusEl.className = "file-item-status"
+        statusEl.textContent = "等待发送"
+        itemEl.appendChild(statusEl)
+
+        const progressWrap = document.createElement("div")
+        progressWrap.className = "file-progress-bar-wrap"
+        const progressBar = document.createElement("div")
+        progressBar.className = "file-progress-bar"
+        progressWrap.appendChild(progressBar)
+        itemEl.appendChild(progressWrap)
+
+        entry.el = itemEl
+        entry.statusEl = statusEl
+        entry.progressBar = progressBar
+
+        fileListEl.appendChild(itemEl)
+      }
+      updateSendButton()
     }
 
     function enableInput(enabled) {
@@ -249,46 +365,51 @@
       return { response, data }
     }
 
-    async function uploadFile(file) {
-      const formData = new FormData()
-      formData.append("file", file, file.name)
-      const response = await fetch(`/api/pairing/${pairingId}/upload`, {
-        method: "POST",
-        credentials: "same-origin",
-        cache: "no-store",
-        body: formData,
-      })
-      if (!response.ok) {
-        let msg = `上传失败（${response.status}）`
-        try {
-          const data = await response.json()
-          if (data.error) msg = data.error
-        } catch (_e) {}
-        throw new Error(msg)
-      }
-      return response.json()
-    }
+    function uploadSingleFile(entry) {
+      return new Promise((resolve) => {
+        const xhr = new XMLHttpRequest()
+        xhr.open("POST", `/api/pairing/${pairingId}/upload`, true)
+        xhr.withCredentials = true
 
-    async function handleFiles(files) {
-      if (!files || files.length === 0) return
-      uploadInProgress = true
-      updateUploadButton(reconnectState === "connected")
-
-      for (let i = 0; i < files.length; i++) {
-        const file = files[i]
-        const label = files.length > 1 ? `（${i + 1}/${files.length}）` : ""
-        setUploadStatus(`正在发送 ${file.name}${label}...`, "uploading")
-        try {
-          await uploadFile(file)
-          setUploadStatus(`已发送：${file.name}${label}`, "ok")
-        } catch (err) {
-          setUploadStatus(`${err.message}`, "err")
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 100)
+            entry.progressBar.style.width = percent + "%"
+            entry.statusEl.textContent = `上传中 ${percent}%`
+          }
         }
-      }
 
-      uploadInProgress = false
-      updateUploadButton(reconnectState === "connected")
-      fileInput.value = ""
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            entry.progressBar.style.width = "100%"
+            entry.progressBar.style.background = "#198754"
+            entry.statusEl.textContent = "✓ 已发送"
+            entry.statusEl.className = "file-item-status file-item-status-ok"
+            resolve(true)
+          } else {
+            let msg = `上传失败（${xhr.status}）`
+            try {
+              const data = JSON.parse(xhr.responseText)
+              if (data.error) msg = data.error
+            } catch (_e) {}
+            entry.progressBar.style.background = "#dc3545"
+            entry.statusEl.textContent = `✗ ${msg}`
+            entry.statusEl.className = "file-item-status file-item-status-err"
+            resolve(false)
+          }
+        }
+
+        xhr.onerror = () => {
+          entry.progressBar.style.background = "#dc3545"
+          entry.statusEl.textContent = "✗ 网络错误"
+          entry.statusEl.className = "file-item-status file-item-status-err"
+          resolve(false)
+        }
+
+        const formData = new FormData()
+        formData.append("file", entry.file, entry.file.name)
+        xhr.send(formData)
+      })
     }
 
     function clearStoredPairingId() {
@@ -504,21 +625,50 @@
         startReconnect()
         return
       }
+
       const content = inputEl.value.trim()
-      if (!content || !ws || ws.readyState !== WebSocket.OPEN) {
-        return
+      const hasText = content !== ""
+      const hasFiles = selectedFiles.length > 0
+
+      if (!hasText && !hasFiles) return
+      if (!ws || ws.readyState !== WebSocket.OPEN) return
+
+      if (hasText) {
+        ws.send(JSON.stringify({ type: "clipboard_text", content }))
+        inputEl.value = ""
       }
-      ws.send(JSON.stringify({ type: "clipboard_text", content }))
-      inputEl.value = ""
-      updateSendButton()
+
+      if (hasFiles) {
+        uploadInProgress = true
+        updateSendButton()
+        updateUploadButton(reconnectState === "connected")
+
+        const removeBtns = document.querySelectorAll(".file-item-remove")
+        for (const btn of removeBtns) btn.disabled = true
+
+        Promise.all(selectedFiles.map((entry) => uploadSingleFile(entry))).then(() => {
+          uploadInProgress = false
+          selectedFiles = []
+          renderFileList()
+          updateUploadButton(reconnectState === "connected")
+          updateSendButton()
+        })
+      } else {
+        updateSendButton()
+      }
     })
 
-    uploadBtn.addEventListener("click", () => {
+    addFileBtn.addEventListener("click", () => {
       if (!uploadInProgress) fileInput.click()
     })
 
     fileInput.addEventListener("change", () => {
-      handleFiles(fileInput.files)
+      if (!fileInput.files || fileInput.files.length === 0) return
+      for (const file of fileInput.files) {
+        selectedFiles.push({ file, id: nextFileId++ })
+      }
+      renderFileList()
+      fileInput.value = ""
     })
 
     bootstrap()

@@ -73,6 +73,11 @@ pub struct ClientConfig {
     pub file_download_timeout_secs: u64,
     /// 文件下载失败时最大重试次数（瞬时错误：连接失败、超时、5xx）。默认 3 次。
     pub file_download_max_retries: u32,
+    /// 图片解码后 RGBA 像素数据内存上限（字节）。默认 209715200（200MB）。
+    ///
+    /// 当 `auto_paste = true` 且收到图片文件时，客户端会预估解码后内存占用（`width × height ×
+    /// 4`）。 超过此阈值时跳过剪贴板路径，改为直接将图片保存到 `file_save_dir`。
+    pub image_clipboard_max_decoded_bytes: u64,
 }
 
 fn default_grpc_port() -> u16 { 50051 }
@@ -89,6 +94,7 @@ fn default_heartbeat_interval_secs() -> u64 { 30 }
 fn default_reconnect_max_interval_secs() -> u64 { 60 }
 fn default_file_download_timeout_secs() -> u64 { 60 }
 fn default_file_download_max_retries() -> u32 { 3 }
+fn default_image_clipboard_max_decoded_bytes() -> u64 { 209_715_200 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RawClientConfig {
@@ -128,6 +134,8 @@ struct RawClientConfig {
     file_download_timeout_secs: u64,
     #[serde(default = "default_file_download_max_retries")]
     file_download_max_retries: u32,
+    #[serde(default = "default_image_clipboard_max_decoded_bytes")]
+    image_clipboard_max_decoded_bytes: u64,
 }
 
 impl From<RawClientConfig> for ClientConfig {
@@ -161,6 +169,7 @@ impl From<RawClientConfig> for ClientConfig {
             file_save_dir: raw.file_save_dir.map(|s| expand_tilde_path(&s)),
             file_download_timeout_secs: raw.file_download_timeout_secs,
             file_download_max_retries: raw.file_download_max_retries,
+            image_clipboard_max_decoded_bytes: raw.image_clipboard_max_decoded_bytes,
         }
     }
 }

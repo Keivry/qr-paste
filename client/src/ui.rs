@@ -356,6 +356,11 @@ impl eframe::App for App {
                                     download_timeout_secs: self.config.file_download_timeout_secs,
                                     download_max_retries: self.config.file_download_max_retries,
                                     public_base_url: self.last_public_base_url.clone(),
+                                    auto_paste: self.config.auto_paste,
+                                    mime_type: file.mime_type.clone(),
+                                    image_clipboard_max_decoded_bytes: self
+                                        .config
+                                        .image_clipboard_max_decoded_bytes,
                                 };
                                 if tx.try_send(job).is_err() {
                                     tracing::warn!("文件任务队列已满，本次文件已丢弃");
