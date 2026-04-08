@@ -66,7 +66,7 @@
       min-height: 0;
     }
     textarea {
-      height: 120px;
+      height: 480px;
       width: 100%;
       min-height: 0;
       padding: 12px;
@@ -210,7 +210,7 @@
       <div class="input-area">
         <textarea id="input" placeholder="输入要发送到 PC 的文本..." disabled></textarea>
       </div>
-      <div id="file-list" style="display:none; margin-bottom: 10px;"></div>
+      <div id="file-list" style="display: none; margin-bottom: 10px"></div>
       <div class="action-area">
         <button id="add-file-btn" type="button" disabled>+</button>
         <input id="file-input" type="file" multiple>
@@ -294,7 +294,7 @@
         const sizeEl = document.createElement("div")
         sizeEl.className = "file-item-size"
         const sizeKb = (entry.file.size / 1024).toFixed(1)
-        sizeEl.textContent = sizeKb > 1024 ? (sizeKb / 1024).toFixed(1) + " MB" : sizeKb + " KB"
+        sizeEl.textContent = sizeKb > 1024 ? `${(sizeKb / 1024).toFixed(1)} MB` : `${sizeKb} KB`
 
         const removeBtn = document.createElement("button")
         removeBtn.className = "file-item-remove"
@@ -374,7 +374,7 @@
         xhr.upload.onprogress = (e) => {
           if (e.lengthComputable) {
             const percent = Math.round((e.loaded / e.total) * 100)
-            entry.progressBar.style.width = percent + "%"
+            entry.progressBar.style.width = `${percent}%`
             entry.statusEl.textContent = `上传中 ${percent}%`
           }
         }
@@ -457,11 +457,15 @@
       try {
         const { response, data } = await api(`/api/pairing/${pairingId}/status`)
         if (response.status === 401) {
-          stopWithError("登录已过期，请重新扫码", { clearStoredPairing: true })
+          stopWithError("登录已过期，请重新扫码", {
+            clearStoredPairing: true,
+          })
           return
         }
         if (response.status === 404) {
-          stopWithError("配对记录不存在，请重新扫码", { clearStoredPairing: true })
+          stopWithError("配对记录不存在，请重新扫码", {
+            clearStoredPairing: true,
+          })
           return
         }
         if (response.ok && data.online) {
@@ -490,7 +494,9 @@
           return
         }
         if (response.status === 404) {
-          stopWithError("配对记录不存在，请重新扫码", { clearStoredPairing: true })
+          stopWithError("配对记录不存在，请重新扫码", {
+            clearStoredPairing: true,
+          })
           return
         }
         if (response.ok && data.ws_ticket) {
@@ -544,9 +550,13 @@
         clearHeartbeat()
         ws = null
         if (event.code === 4001) {
-          stopWithError("已在其他设备上打开，可点下方按钮重新连接", { allowReconnect: true })
+          stopWithError("已在其他设备上打开，可点下方按钮重新连接", {
+            allowReconnect: true,
+          })
         } else if (event.code === 4002) {
-          stopWithError("凭据已更新，请重新扫码", { clearStoredPairing: true })
+          stopWithError("凭据已更新，请重新扫码", {
+            clearStoredPairing: true,
+          })
         } else {
           reconnectState = "idle"
           setActionMode("send")
