@@ -70,6 +70,27 @@ fn process_file_job(job: FileJob) -> String {
         if let Some(channel) = job.grpc_channel {
             match download_via_grpc_stream(event, channel, &job.file_save_dir) {
                 Ok((tmp_path, total_bytes)) => {
+                    #[cfg(target_os = "windows")]
+                    if job.auto_paste && job.mime_type.starts_with("image/") {
+                        match process_image_from_tmp(
+                            &job,
+                            &tmp_path,
+                            &dest_path,
+                            &file_name,
+                            total_bytes,
+                        ) {
+                            Ok(notice) => {
+                                send_ack(&client, event, &job.public_base_url, true);
+                                return notice;
+                            }
+                            Err(DownloadError::Terminal(msg))
+                            | Err(DownloadError::Transient(msg)) => {
+                                send_ack(&client, event, &job.public_base_url, false);
+                                return msg;
+                            }
+                        }
+                    }
+
                     match persist_tmp_as_saved_file(&tmp_path, &dest_path, &file_name, total_bytes)
                     {
                         Ok(notice) => {
@@ -177,10 +198,20 @@ fn process_image_job(
 ) -> Result<String, DownloadError> {
     let (tmp_path, total_bytes) =
         try_download_to_tmp(client, &job.event, bearer, &job.file_save_dir)?;
+    process_image_from_tmp(job, &tmp_path, dest_path, file_name, total_bytes)
+}
 
+#[cfg(target_os = "windows")]
+fn process_image_from_tmp(
+    job: &FileJob,
+    tmp_path: &Path,
+    dest_path: &Path,
+    file_name: &str,
+    total_bytes: u64,
+) -> Result<String, DownloadError> {
     // 先用 into_dimensions() 做廉价的尺寸预检（只读文件头，无需完整解码），
     // 通过后再 decode；两步共用同一次 open，避免重复打开文件。
-    let reader = match open_image_reader(&tmp_path) {
+    let reader = match open_image_reader(tmp_path) {
         Ok(reader) => reader,
         Err(err) => {
             info!(
