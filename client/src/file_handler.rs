@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use {
-    crate::grpc::relay::FileReceived,
+    crate::grpc::relay::{FileReceived, StreamFileRequest, TransferMode},
     sha2::{Digest, Sha256},
     std::{
         io::{Read, Write},
@@ -9,6 +9,7 @@ use {
         sync::mpsc,
         time::Duration,
     },
+    tonic::transport::Channel,
     tracing::{info, warn},
     uuid::Uuid,
 };
@@ -28,6 +29,7 @@ pub struct FileJob {
     pub simulate_key_after_paste: Option<String>,
     pub paste_delay_ms: u64,
     pub key_after_paste_delay_ms: u64,
+    pub grpc_channel: Option<Channel>,
 }
 
 pub fn start_file_worker(
@@ -47,7 +49,6 @@ pub fn start_file_worker(
 fn process_file_job(job: FileJob) -> String {
     let event = &job.event;
     let file_name = sanitize_file_name_for_save(&event.file_name);
-
     let dest_path = unique_dest_path(&job.file_save_dir, &file_name);
 
     let client = match reqwest::blocking::Client::builder()
@@ -61,6 +62,34 @@ fn process_file_job(job: FileJob) -> String {
     if let Err(e) = std::fs::create_dir_all(&job.file_save_dir) {
         send_ack(&client, event, &job.public_base_url, false);
         return format!("⚠ 无法创建保存目录 {}：{e}", job.file_save_dir.display());
+    }
+
+    let transfer_mode = TransferMode::try_from(event.transfer_mode).unwrap_or(TransferMode::Relay);
+
+    if transfer_mode == TransferMode::Streaming {
+        if let Some(channel) = job.grpc_channel {
+            match download_via_grpc_stream(event, channel, &job.file_save_dir) {
+                Ok((tmp_path, total_bytes)) => {
+                    match persist_tmp_as_saved_file(&tmp_path, &dest_path, &file_name, total_bytes)
+                    {
+                        Ok(notice) => {
+                            send_ack(&client, event, &job.public_base_url, true);
+                            return notice;
+                        }
+                        Err(DownloadError::Terminal(msg)) | Err(DownloadError::Transient(msg)) => {
+                            send_ack(&client, event, &job.public_base_url, false);
+                            return msg;
+                        }
+                    }
+                }
+                Err(msg) => {
+                    send_ack(&client, event, &job.public_base_url, false);
+                    return msg;
+                }
+            }
+        } else {
+            warn!(file_id = %event.file_id, "STREAMING 模式但 grpc_channel 未就绪，回退 RELAY");
+        }
     }
 
     let bearer = hex::encode(&event.file_access_token);
@@ -97,7 +126,6 @@ fn process_file_job(job: FileJob) -> String {
                 return notice;
             }
             Err(DownloadError::Terminal(msg)) => {
-                // 终态错误（404、401、SHA-256 校验失败等），不重试。
                 send_ack(&client, event, &job.public_base_url, false);
                 return msg;
             }
@@ -274,6 +302,101 @@ fn try_download_to_tmp(
     tmp_dir: &Path,
 ) -> Result<(PathBuf, u64), DownloadError> {
     download_to_tmp(client, event, bearer, tmp_dir)
+}
+
+fn download_via_grpc_stream(
+    event: &FileReceived,
+    channel: Channel,
+    tmp_dir: &Path,
+) -> Result<(PathBuf, u64), String> {
+    use crate::grpc::relay::client_relay_client::ClientRelayClient;
+
+    let file_id = event.file_id.clone();
+    let token = event.file_access_token.clone();
+    let file_name = event.file_name.clone();
+
+    let tmp_path = tmp_dir.join(format!(".{}.tmp", Uuid::new_v4()));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("⚠ gRPC 运行时初始化失败：{e}"))?;
+
+    rt.block_on(async move {
+        let mut client = ClientRelayClient::new(channel);
+
+        let request = StreamFileRequest {
+            file_id: file_id.clone(),
+            file_access_token: token,
+        };
+
+        let mut stream = client
+            .stream_file(request)
+            .await
+            .map_err(|s| format!("⚠ StreamFile RPC 失败：{} {}", s.code(), s.message()))?
+            .into_inner();
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .await
+            .map_err(|e| format!("⚠ 无法创建临时文件 {}：{e}", tmp_path.display()))?;
+
+        let mut hasher = Sha256::new();
+        let mut total_bytes: u64 = 0;
+
+        loop {
+            let chunk = match stream.message().await {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(format!("⚠ gRPC 流提前关闭，未收到终止帧：{file_name}"));
+                }
+                Err(s) => {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(format!("⚠ gRPC 流错误：{} {}", s.code(), s.message()));
+                }
+            };
+
+            if chunk.is_last {
+                drop(file);
+                let expected_sha256 = chunk.sha256;
+                let computed = hasher.finalize();
+                if expected_sha256 != computed.as_slice() {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    warn!(
+                        file_id = %file_id,
+                        expected = %hex::encode(&expected_sha256),
+                        computed = %hex::encode(computed),
+                        "gRPC 流 SHA-256 校验失败"
+                    );
+                    return Err(format!("⚠ 文件 {file_name} sha256 mismatch，已丢弃"));
+                }
+                info!(file_id = %file_id, size = total_bytes, "gRPC 流接收完成，SHA-256 校验通过");
+                return Ok((tmp_path, total_bytes));
+            }
+
+            let data = &chunk.data;
+            hasher.update(data);
+            total_bytes = match total_bytes.checked_add(data.len() as u64) {
+                Some(v) => v,
+                None => {
+                    drop(file);
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err("⚠ gRPC 流文件大小溢出".to_string());
+                }
+            };
+            use tokio::io::AsyncWriteExt as _;
+            if let Err(e) = file.write_all(data).await {
+                drop(file);
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(format!("⚠ gRPC 流写入临时文件失败：{e}"));
+            }
+        }
+    })
 }
 
 fn download_to_tmp(

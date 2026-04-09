@@ -11,15 +11,18 @@ use {
         pairing::{PairingEntry, PairingStore, encode_hex, random_bytes_32},
         persist::PersistenceStore,
         session::{Session, SessionStore, latest_session_token},
+        upload_store::{AttachError, StreamItem, UploadStore},
     },
     common::ServerToMobileMessage,
     dashmap::DashMap,
     futures::Stream,
     relay::{
+        FileChunk,
         PingRequest,
         PingResponse,
         ServerEvent,
         SessionToken,
+        StreamFileRequest,
         SubscribeRequest,
         client_relay_server::{ClientRelay, ClientRelayServer},
     },
@@ -47,6 +50,7 @@ pub struct ClientRelayService {
     trusted_proxies: TrustedProxyCidrs,
     grpc_tokens: Arc<DashMap<String, ()>>,
     persist: Option<Arc<PersistenceStore>>,
+    upload_store: Arc<UploadStore>,
 }
 
 impl ClientRelayService {
@@ -56,6 +60,7 @@ impl ClientRelayService {
         pairing_store: PairingStore,
         config: ServerConfig,
         persist: Option<Arc<PersistenceStore>>,
+        upload_store: Arc<UploadStore>,
     ) -> anyhow::Result<Self> {
         let trusted_proxies = config.trusted_proxy_ranges()?;
         Ok(Self {
@@ -65,6 +70,7 @@ impl ClientRelayService {
             trusted_proxies,
             grpc_tokens: Arc::new(DashMap::new()),
             persist,
+            upload_store,
         })
     }
 }
@@ -115,6 +121,8 @@ impl Drop for SessionStream {
 
 #[tonic::async_trait]
 impl ClientRelay for ClientRelayService {
+    type StreamFileStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<FileChunk, Status>> + Send + 'static>>;
     type SubscribeStream = SessionStream;
 
     /// PC 客户端订阅事件流的入口。
@@ -213,6 +221,90 @@ impl ClientRelay for ClientRelayService {
         }
         Ok(Response::new(PingResponse {}))
     }
+
+    async fn stream_file(
+        &self,
+        request: Request<StreamFileRequest>,
+    ) -> Result<Response<Self::StreamFileStream>, Status> {
+        let req = request.into_inner();
+
+        let file_id =
+            Uuid::parse_str(&req.file_id).map_err(|_| Status::not_found("file not found"))?;
+
+        // SC2 错误优先级：NOT_FOUND → UNAUTHENTICATED → FAILED_PRECONDITION
+        // 先检查 file_id 存在性，避免通过 token 差异泄露 file 是否存在
+        let meta = self
+            .upload_store
+            .get_file_meta(file_id)
+            .ok_or_else(|| Status::not_found("file not found"))?;
+
+        // 常量时间比较，防止 timing 攻击
+        if !bool::from(
+            req.file_access_token
+                .as_slice()
+                .ct_eq(meta.file_access_token.as_slice()),
+        ) {
+            return Err(Status::unauthenticated("invalid file_access_token"));
+        }
+
+        let rx = self
+            .upload_store
+            .attach_stream(file_id)
+            .map_err(|e| match e {
+                AttachError::NotFound => Status::not_found("file not found"),
+                AttachError::AlreadyAttached => {
+                    Status::failed_precondition("stream already attached")
+                }
+            })?;
+
+        let store = Arc::clone(&self.upload_store);
+        let stream = async_stream::stream! {
+            let mut rx = rx;
+            let mut seq: u32 = 0;
+            // Drop guard: 无论 stream 正常结束、Abort 还是被外部 cancel，都清理 state。
+            let _guard = StreamingStateGuard { store: Arc::clone(&store), file_id };
+            while let Some(item) = rx.recv().await {
+                match item {
+                    StreamItem::Data(data) => {
+                        yield Ok(FileChunk {
+                            sequence_number: seq,
+                            data: data.to_vec(),
+                            is_last: false,
+                            sha256: Vec::new(),
+                        });
+                        seq = seq.saturating_add(1);
+                    }
+                    StreamItem::End { sha256 } => {
+                        yield Ok(FileChunk {
+                            sequence_number: seq,
+                            data: Vec::new(),
+                            is_last: true,
+                            sha256: sha256.to_vec(),
+                        });
+                        return;
+                    }
+                    StreamItem::Abort { reason } => {
+                        warn!(file_id = %file_id, reason = %reason, "STREAMING aborted");
+                        yield Err(Status::internal(format!("stream aborted: {reason}")));
+                        return;
+                    }
+                }
+            }
+            yield Err(Status::internal("stream closed unexpectedly"));
+        };
+
+        info!(file_id = %file_id, "STREAMING gRPC stream attached");
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+struct StreamingStateGuard {
+    store: Arc<UploadStore>,
+    file_id: Uuid,
+}
+
+impl Drop for StreamingStateGuard {
+    fn drop(&mut self) { self.store.remove_streaming_state(self.file_id); }
 }
 
 fn cleanup_session_on_client_disconnect(
@@ -283,6 +375,7 @@ pub async fn serve(
     pairing_store: PairingStore,
     config: ServerConfig,
     persist: Option<Arc<PersistenceStore>>,
+    upload_store: Arc<UploadStore>,
 ) -> anyhow::Result<()> {
     let keepalive_interval = Duration::from_secs(config.grpc_keepalive_interval_secs);
     let keepalive_timeout = Duration::from_secs(config.grpc_keepalive_timeout_secs);
@@ -292,6 +385,7 @@ pub async fn serve(
         pairing_store,
         config,
         persist,
+        upload_store,
     )?);
 
     tonic::transport::Server::builder()
@@ -395,7 +489,7 @@ fn upsert_pairing(
 mod tests {
     use {
         super::*,
-        crate::{config::ServerConfig, session::new_store},
+        crate::{config::ServerConfig, session::new_store, upload_store::new_upload_store},
         tokio::sync::mpsc,
         tokio_stream::StreamExt,
     };
@@ -433,6 +527,10 @@ mod tests {
         }
     }
 
+    fn test_upload_store() -> Arc<UploadStore> {
+        new_upload_store(52_428_800, 20, 500, 2_147_483_648)
+    }
+
     const TEST_PAIRING_ID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     #[tokio::test]
@@ -442,6 +540,7 @@ mod tests {
             crate::pairing::new_pairing_store(),
             test_config(),
             None,
+            test_upload_store(),
         )
         .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
@@ -464,6 +563,7 @@ mod tests {
             crate::pairing::new_pairing_store(),
             test_config(),
             None,
+            test_upload_store(),
         )
         .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
@@ -483,8 +583,14 @@ mod tests {
     async fn subscribe_creates_session_and_sends_first_event() {
         let store = new_store();
         let pairing_store = crate::pairing::new_pairing_store();
-        let service = ClientRelayService::new(store.clone(), pairing_store, test_config(), None)
-            .expect("test config should be valid");
+        let service = ClientRelayService::new(
+            store.clone(),
+            pairing_store,
+            test_config(),
+            None,
+            test_upload_store(),
+        )
+        .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
             auth_token: "shared-secret-xx".to_string(),
             pairing_id: TEST_PAIRING_ID.to_string(),
@@ -507,7 +613,6 @@ mod tests {
         match first.event {
             Some(relay::server_event::Event::SessionToken(token)) => {
                 assert!(!token.token.is_empty());
-                // URL 格式：{public_base_url}/m/{pairing_id}#ps={secret_hex}
                 assert!(
                     token.url.contains(&format!("/m/{TEST_PAIRING_ID}#ps=")),
                     "URL should use new pairing path, got: {}",
@@ -523,9 +628,14 @@ mod tests {
     async fn dropping_grpc_stream_removes_session() {
         let store = new_store();
         let pairing_store = crate::pairing::new_pairing_store();
-        let service =
-            ClientRelayService::new(store.clone(), pairing_store.clone(), test_config(), None)
-                .expect("test config should be valid");
+        let service = ClientRelayService::new(
+            store.clone(),
+            pairing_store.clone(),
+            test_config(),
+            None,
+            test_upload_store(),
+        )
+        .expect("test config should be valid");
         let request = Request::new(SubscribeRequest {
             auth_token: "shared-secret-xx".to_string(),
             pairing_id: TEST_PAIRING_ID.to_string(),

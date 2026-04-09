@@ -29,7 +29,14 @@ use {
         },
         persist::PersistenceStore,
         session::{SessionStore, latest_session_token},
-        upload_store::{SaveFileError, UploadLimitError, UploadStore},
+        upload_store::{
+            SaveFileError,
+            SendChunkResult,
+            SendTerminalResult,
+            UploadLimitError,
+            UploadStore,
+            sanitize_file_name,
+        },
     },
     axum::{
         Json,
@@ -784,15 +791,11 @@ async fn handle_revoke(
     response
 }
 
-/// 处理手机端文件上传（`POST /api/pairing/{pairing_id}/upload`）。
-///
-/// 验证浏览器会话后，将 multipart 文件存入 upload_store，并通过 gRPC 推送通知 PC 客户端。
-/// 响应包含 file_id、file_name、mime_type、size_bytes、sha256。
 async fn handle_upload(
     Path(pairing_id): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
-    multipart: Multipart,
+    mut multipart: Multipart,
 ) -> Response {
     if let Err(status) = require_browser_origin(&state, &headers) {
         return error_json(status, "forbidden");
@@ -812,29 +815,364 @@ async fn handle_upload(
     let max_upload_size = state.config.max_upload_size_bytes;
     let body_timeout = Duration::from_secs(state.config.upload_body_timeout_secs);
 
+    let field = match multipart
+        .next_field()
+        .await
+        .map_err(|e| SaveFileError::Io(format!("multipart 读取失败: {e}")))
+    {
+        Ok(Some(f)) => f,
+        Ok(None) => return error_json(StatusCode::UNPROCESSABLE_ENTITY, "no_file_field"),
+        Err(SaveFileError::Io(e)) => {
+            warn!("multipart 读取失败 pairing_id={pairing_id}: {e}");
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        }
+        Err(_) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+    };
+
+    let raw_filename = field.file_name().unwrap_or_default().to_string();
+    let mime_type = {
+        let tentative_name = sanitize_file_name(&raw_filename, &Uuid::nil());
+        field
+            .content_type()
+            .map(|ct| ct.to_string())
+            .unwrap_or_else(|| {
+                mime_guess::from_path(&tentative_name)
+                    .first_or_octet_stream()
+                    .to_string()
+            })
+    };
+
+    let (file_id, file_access_token, file_name) =
+        match state
+            .upload_store
+            .begin_upload(pairing_id, &raw_filename, mime_type.clone())
+        {
+            Ok(v) => v,
+            Err(SaveFileError::Limit(limit_err)) => {
+                let msg = match limit_err {
+                    UploadLimitError::PerPairingFileLimitReached => "per_pairing_file_limit",
+                    UploadLimitError::GlobalFileLimitReached => "global_file_limit",
+                    UploadLimitError::GlobalByteLimitReached => "global_byte_limit",
+                    UploadLimitError::PairingClosed => "pairing_closed",
+                };
+                return error_json(StatusCode::TOO_MANY_REQUESTS, msg);
+            }
+            Err(e) => {
+                warn!("begin_upload 失败 pairing_id={pairing_id}: {e:?}");
+                return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+            }
+        };
+
+    let client_tx = current_client_tx(&state.store, &state.pairing_store, pairing_id);
+
+    if let Some(tx) = client_tx {
+        handle_upload_streaming(
+            state,
+            pairing_id,
+            file_id,
+            file_access_token,
+            file_name,
+            raw_filename,
+            mime_type,
+            field,
+            tx,
+            upload_dir,
+            max_upload_size,
+            body_timeout,
+        )
+        .await
+    } else {
+        handle_upload_relay(
+            state,
+            pairing_id,
+            file_id,
+            file_access_token,
+            file_name,
+            raw_filename,
+            mime_type,
+            field,
+            upload_dir,
+            max_upload_size,
+            body_timeout,
+        )
+        .await
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_upload_streaming(
+    state: AppState,
+    pairing_id: Uuid,
+    file_id: Uuid,
+    file_access_token: [u8; 32],
+    file_name: String,
+    raw_filename: String,
+    mime_type: String,
+    field: axum::extract::multipart::Field<'_>,
+    tx: mpsc::Sender<Result<crate::grpc::relay::ServerEvent, tonic::Status>>,
+    upload_dir: std::path::PathBuf,
+    max_upload_size: u64,
+    body_timeout: Duration,
+) -> Response {
+    use {futures::StreamExt as _, sha2::Digest as _, tokio::io::AsyncWriteExt as _};
+
+    state.upload_store.create_streaming_state(file_id);
+
+    let download_url = format!(
+        "{}/api/files/{file_id}",
+        state.config.public_base_url.trim_end_matches('/')
+    );
+    let event = crate::grpc::relay::ServerEvent {
+        event: Some(crate::grpc::relay::server_event::Event::FileReceived(
+            FileReceived {
+                file_id: file_id.to_string(),
+                file_name: file_name.clone(),
+                mime_type: mime_type.clone(),
+                size_bytes: 0,
+                download_url,
+                sha256: String::new(),
+                transfer_mode: TransferMode::Streaming as i32,
+                file_access_token: file_access_token.to_vec(),
+            },
+        )),
+        grpc_session_token: String::new(),
+    };
+    if tx.send(Ok(event)).await.is_err() {
+        warn!("STREAMING FileReceived 发送失败 file_id={file_id} pairing_id={pairing_id}");
+        state.upload_store.remove_streaming_state(file_id);
+        state.upload_store.rollback_upload(file_id, pairing_id);
+        return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    }
+
+    let tmp_name = format!(".{file_id}.tmp");
+    let tmp_path = upload_dir.join(&tmp_name);
+
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("STREAMING 创建临时文件失败 file_id={file_id}: {e}");
+            if let SendTerminalResult::Timeout = state
+                .upload_store
+                .send_abort(file_id, "tmp_create_failed".to_string())
+                .await
+            {
+                warn!("STREAMING send_abort 超时（tmp_create_failed）file_id={file_id}");
+            }
+            state.upload_store.rollback_upload(file_id, pairing_id);
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        }
+    };
+
+    let mut hasher = sha2::Sha256::new();
+    let mut total_bytes: u64 = 0;
+    let mut field = field;
+    let mut streaming_aborted = false;
+
+    loop {
+        let next = tokio::time::timeout(body_timeout, field.next()).await;
+        let chunk = match next {
+            Err(_) => {
+                let _ = file.flush().await;
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                if !streaming_aborted
+                    && let SendTerminalResult::Timeout = state
+                        .upload_store
+                        .send_abort(file_id, "upload_timeout".to_string())
+                        .await
+                {
+                    warn!("STREAMING send_abort 超时（upload_timeout）file_id={file_id}");
+                }
+                state.upload_store.rollback_upload(file_id, pairing_id);
+                return error_json(StatusCode::REQUEST_TIMEOUT, "upload_timeout");
+            }
+            Ok(None) => break,
+            Ok(Some(res)) => match res {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = file.flush().await;
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    warn!("STREAMING 读取 multipart chunk 失败 file_id={file_id}: {e}");
+                    if !streaming_aborted
+                        && let SendTerminalResult::Timeout = state
+                            .upload_store
+                            .send_abort(file_id, "read_error".to_string())
+                            .await
+                    {
+                        warn!("STREAMING send_abort 超时（read_error）file_id={file_id}");
+                    }
+                    state.upload_store.rollback_upload(file_id, pairing_id);
+                    return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+                }
+            },
+        };
+
+        let chunk_len = chunk.len() as u64;
+        total_bytes = total_bytes.saturating_add(chunk_len);
+        if total_bytes > max_upload_size {
+            let _ = file.flush().await;
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            if !streaming_aborted
+                && let SendTerminalResult::Timeout = state
+                    .upload_store
+                    .send_abort(file_id, "too_large".to_string())
+                    .await
+            {
+                warn!("STREAMING send_abort 超时（too_large）file_id={file_id}");
+            }
+            state.upload_store.rollback_upload(file_id, pairing_id);
+            return error_json(StatusCode::PAYLOAD_TOO_LARGE, "file_too_large");
+        }
+
+        hasher.update(&chunk);
+
+        if let Err(e) = file.write_all(&chunk).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            warn!("STREAMING 写盘失败 file_id={file_id}: {e}");
+            if !streaming_aborted
+                && let SendTerminalResult::Timeout = state
+                    .upload_store
+                    .send_abort(file_id, "io_error".to_string())
+                    .await
+            {
+                warn!("STREAMING send_abort 超时（io_error）file_id={file_id}");
+            }
+            state.upload_store.rollback_upload(file_id, pairing_id);
+            return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+        }
+
+        if !streaming_aborted {
+            let bytes = bytes::Bytes::copy_from_slice(&chunk);
+            match state.upload_store.send_chunk(file_id, bytes).await {
+                SendChunkResult::Ok => {}
+                SendChunkResult::Disconnected => {
+                    warn!("STREAMING send_chunk 断连 file_id={file_id} pairing_id={pairing_id}");
+                    if let SendTerminalResult::Timeout = state
+                        .upload_store
+                        .send_abort(file_id, "disconnected".to_string())
+                        .await
+                    {
+                        warn!("STREAMING send_abort 超时（disconnected）file_id={file_id}");
+                    }
+                    streaming_aborted = true;
+                }
+                SendChunkResult::Timeout => {
+                    warn!(
+                        "STREAMING send_chunk backpressure 超时 file_id={file_id} pairing_id={pairing_id}"
+                    );
+                    if let SendTerminalResult::Timeout = state
+                        .upload_store
+                        .send_abort(file_id, "backpressure_timeout".to_string())
+                        .await
+                    {
+                        warn!("STREAMING send_abort 超时（backpressure_timeout）file_id={file_id}");
+                    }
+                    streaming_aborted = true;
+                }
+            }
+        }
+    }
+
+    if let Err(e) = file.flush().await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        warn!("STREAMING flush 失败 file_id={file_id}: {e}");
+        if !streaming_aborted
+            && let SendTerminalResult::Timeout = state
+                .upload_store
+                .send_abort(file_id, "flush_error".to_string())
+                .await
+        {
+            warn!("STREAMING send_abort 超时（flush_error）file_id={file_id}");
+        }
+        state.upload_store.rollback_upload(file_id, pairing_id);
+        return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    }
+    drop(file);
+
+    let hash = hasher.finalize();
+    let sha256_bytes: [u8; 32] = hash.into();
+    let sha256_hex: String = sha256_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+    let final_path = upload_dir.join(file_id.to_string());
+    if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        warn!("STREAMING rename 失败 file_id={file_id}: {e}");
+        if !streaming_aborted
+            && let SendTerminalResult::Timeout = state
+                .upload_store
+                .send_abort(file_id, "rename_failed".to_string())
+                .await
+        {
+            warn!("STREAMING send_abort 超时（rename_failed）file_id={file_id}");
+        }
+        state.upload_store.rollback_upload(file_id, pairing_id);
+        return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
+    }
+
+    state
+        .upload_store
+        .mark_streaming_done(file_id, final_path, total_bytes, sha256_bytes);
+
+    if !streaming_aborted {
+        match state.upload_store.send_end(file_id, sha256_bytes).await {
+            SendTerminalResult::Sent => {}
+            SendTerminalResult::Disconnected => {
+                warn!("STREAMING send_end 断连（文件已提交）file_id={file_id}");
+            }
+            SendTerminalResult::Timeout => {
+                warn!("STREAMING send_end 超时（文件已提交）file_id={file_id}");
+            }
+        }
+    }
+
+    let mut response = Json(json!({
+        "file_id": file_id.to_string(),
+        "file_name": raw_filename,
+        "mime_type": mime_type,
+        "size_bytes": total_bytes,
+        "sha256": sha256_hex,
+    }))
+    .into_response();
+    apply_common_headers(response.headers_mut());
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_upload_relay(
+    state: AppState,
+    pairing_id: Uuid,
+    file_id: Uuid,
+    file_access_token: [u8; 32],
+    file_name: String,
+    raw_filename: String,
+    _mime_type: String,
+    field: axum::extract::multipart::Field<'_>,
+    upload_dir: std::path::PathBuf,
+    max_upload_size: u64,
+    body_timeout: Duration,
+) -> Response {
     let save_result = state
         .upload_store
-        .save_file(
+        .save_file_from_field(
             &upload_dir,
+            file_id,
             pairing_id,
-            multipart,
+            field,
             max_upload_size,
             body_timeout,
         )
         .await;
 
-    let (file_id, meta) = match save_result {
+    match save_result {
         Err(SaveFileError::Timeout) => {
             return error_json(StatusCode::REQUEST_TIMEOUT, "upload_timeout");
         }
         Err(SaveFileError::TooLarge) => {
             return error_json(StatusCode::PAYLOAD_TOO_LARGE, "file_too_large");
-        }
-        Err(SaveFileError::NoFileField) => {
-            return error_json(StatusCode::UNPROCESSABLE_ENTITY, "no_file_field");
-        }
-        Err(SaveFileError::TooManyFields) => {
-            return error_json(StatusCode::UNPROCESSABLE_ENTITY, "too_many_fields");
         }
         Err(SaveFileError::Limit(limit_err)) => {
             let msg = match limit_err {
@@ -846,13 +1184,17 @@ async fn handle_upload(
             return error_json(StatusCode::TOO_MANY_REQUESTS, msg);
         }
         Err(SaveFileError::Io(err)) => {
-            warn!("上传文件 IO 错误 pairing_id={pairing_id}: {err}");
+            warn!("RELAY 上传文件 IO 错误 pairing_id={pairing_id}: {err}");
             return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
         }
-        Ok(result) => result,
+        Ok(()) => {}
+    }
+
+    let Some(meta) = state.upload_store.get_file_meta(file_id) else {
+        warn!("RELAY 写盘后 FileMeta 丢失 file_id={file_id}");
+        return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
     };
 
-    // 三步并发安全 gRPC 推送
     if state.upload_store.begin_notifying(file_id, pairing_id) {
         let download_url = format!(
             "{}/api/files/{file_id}",
@@ -861,19 +1203,19 @@ async fn handle_upload(
         let event = ServerEvent {
             event: Some(Event::FileReceived(FileReceived {
                 file_id: file_id.to_string(),
-                file_name: meta.file_name.clone(),
+                file_name: file_name.clone(),
                 mime_type: meta.mime_type.clone(),
                 size_bytes: meta.size_bytes,
                 download_url,
                 sha256: meta.sha256.clone(),
                 transfer_mode: TransferMode::Relay as i32,
-                file_access_token: meta.file_access_token.to_vec(),
+                file_access_token: file_access_token.to_vec(),
             })),
             grpc_session_token: String::new(),
         };
         let client_tx = current_client_tx(&state.store, &state.pairing_store, pairing_id);
-        if let Some(tx) = client_tx {
-            match tx.send(Ok(event)).await {
+        if let Some(relay_tx) = client_tx {
+            match relay_tx.send(Ok(event)).await {
                 Ok(()) => state.upload_store.mark_notified(file_id),
                 Err(_) => {
                     let store = state.upload_store.clone();
@@ -881,20 +1223,19 @@ async fn handle_upload(
                         store.mark_notify_failed(file_id);
                     });
                     warn!(
-                        "gRPC 推送失败（接收端已关闭） file_id={file_id} pairing_id={pairing_id}"
+                        "RELAY gRPC 推送失败（接收端已关闭） file_id={file_id} pairing_id={pairing_id}"
                     );
                 }
             }
         } else {
-            // 无活跃 gRPC 订阅，仅记录日志，文件保留等待下次推送机会
-            warn!("上传完成但无活跃 gRPC 订阅 file_id={file_id} pairing_id={pairing_id}");
+            warn!("RELAY 上传完成但无活跃 gRPC 订阅 file_id={file_id} pairing_id={pairing_id}");
             state.upload_store.mark_notify_failed(file_id);
         }
     }
 
     let mut response = Json(json!({
         "file_id": file_id.to_string(),
-        "file_name": meta.raw_filename,
+        "file_name": raw_filename,
         "mime_type": meta.mime_type,
         "size_bytes": meta.size_bytes,
         "sha256": meta.sha256,
@@ -985,7 +1326,6 @@ async fn handle_file_download(
 
 #[derive(Deserialize)]
 struct AckBody {
-    #[allow(dead_code)]
     success: bool,
 }
 
@@ -1016,11 +1356,13 @@ async fn handle_file_ack(
         if provided_token.ct_ne(&meta.file_access_token).into() {
             return error_json(StatusCode::NOT_FOUND, "file_not_found");
         }
-        let _ack: AckBody = match serde_json::from_slice(&body) {
+        let ack: AckBody = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid_format"),
         };
-        state.upload_store.remove_file(file_id);
+        if ack.success {
+            state.upload_store.remove_file(file_id);
+        }
     }
 
     let mut response = Json(json!({"ok": true})).into_response();

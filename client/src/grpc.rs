@@ -64,6 +64,10 @@ pub enum ClientEvent {
     ClipboardText { content: String },
     /// 服务端通知 PC 客户端有文件可供下载。
     FileReceived(relay::FileReceived),
+    /// 主 gRPC Channel 已就绪，可直接用于 StreamFile 等后续 RPC。
+    ///
+    /// 连接建立后立即发送，UI 缓存此 channel 以供文件流复用，避免重复建立 TLS 连接。
+    GrpcChannel { channel: Channel },
     /// gRPC 连接发生不可恢复的错误。
     Error { message: String },
 }
@@ -115,7 +119,7 @@ pub fn start(options: StartOptions, tx: mpsc::Sender<ClientEvent>, repaint_ctx: 
             }
             info!("{connecting_message}");
 
-            let mut client = match connect_client(&endpoint_config, &tx, &repaint_ctx).await {
+            let (mut client, grpc_channel) = match connect_client(&endpoint_config, &tx, &repaint_ctx).await {
                 Err(e) => {
                     let message = format!("连接服务端失败：{e}");
                     warn!("{message}");
@@ -128,7 +132,7 @@ pub fn start(options: StartOptions, tx: mpsc::Sender<ClientEvent>, repaint_ctx: 
                     );
                     return;
                 }
-                Ok(client) => client,
+                Ok(pair) => pair,
             };
 
             match tokio::time::timeout(
@@ -227,6 +231,16 @@ pub fn start(options: StartOptions, tx: mpsc::Sender<ClientEvent>, repaint_ctx: 
                         }
 
                         if !send_event(&tx, &repaint_ctx, first_event) {
+                            return;
+                        }
+
+                        if !send_event(
+                            &tx,
+                            &repaint_ctx,
+                            ClientEvent::GrpcChannel {
+                                channel: grpc_channel.clone(),
+                            },
+                        ) {
                             return;
                         }
 
@@ -373,7 +387,7 @@ async fn connect_client(
     endpoint_config: &GrpcEndpointConfig,
     tx: &mpsc::Sender<ClientEvent>,
     repaint_ctx: &Context,
-) -> Result<ClientRelayClient<Channel>, String> {
+) -> Result<(ClientRelayClient<Channel>, Channel), String> {
     let mut endpoint = Endpoint::from_shared(endpoint_config.endpoint.clone())
         .map_err(|err| format!("gRPC 地址无效：{err}"))?
         .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS));
@@ -408,7 +422,7 @@ async fn connect_client(
     .map_err(|_| format!("连接服务端超时（>{CONNECT_TIMEOUT_SECS} 秒）"))?
     .map_err(|err| format!("{err}"))?;
 
-    Ok(ClientRelayClient::new(channel))
+    Ok((ClientRelayClient::new(channel.clone()), channel))
 }
 
 fn send_event(tx: &mpsc::Sender<ClientEvent>, repaint_ctx: &Context, event: ClientEvent) -> bool {

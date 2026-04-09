@@ -6,6 +6,7 @@ package relay;
 service ClientRelay {
   rpc Subscribe(SubscribeRequest) returns (stream ServerEvent);
   rpc Ping(PingRequest) returns (PingResponse);
+  rpc StreamFile(StreamFileRequest) returns (stream FileChunk);
 }
 
 message SubscribeRequest {
@@ -43,10 +44,11 @@ message ClipboardText {
 
 message Ping {}
 
-/// 文件传输模式。RELAY 表示通过服务端中继下载，P2P 为未来 P2P 直连预留。
+/// 文件传输模式。RELAY 表示通过服务端中继下载，P2P 为未来 P2P 直连预留，STREAMING 为 gRPC 流式直传。
 enum TransferMode {
   RELAY = 0;
   P2P = 1;
+  STREAMING = 2;
 }
 
 /// 服务端通过 gRPC 流向 PC 客户端推送文件接收通知。
@@ -72,3 +74,20 @@ message PingRequest {
 }
 
 message PingResponse {}
+
+/// PC 客户端向服务端请求 gRPC 流式文件接收。
+message StreamFileRequest {
+  string file_id = 1;
+  bytes file_access_token = 2;
+}
+
+/// 服务端向 PC 客户端流式推送的文件数据帧。
+///
+/// `is_last=false` 时 `data` 为文件内容；`is_last=true` 时 `data` 为空，
+/// `sha256` 为完整文件的 SHA-256（32 字节原始数据）。
+message FileChunk {
+  uint32 sequence_number = 1;
+  bytes data = 2;
+  bool is_last = 3;
+  bytes sha256 = 4;
+}

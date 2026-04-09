@@ -131,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
             error!("HTTP server exited: {:?}", res);
             res?
         },
-        res = grpc::serve(addr_grpc, store.clone(), pairing_store.clone(), cfg.clone(), persist.clone()) => {
+        res = grpc::serve(addr_grpc, store.clone(), pairing_store.clone(), cfg.clone(), persist.clone(), upload_store.clone()) => {
             shutdown.cancel();
             error!("gRPC server exited: {:?}", res);
             res?

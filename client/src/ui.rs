@@ -13,6 +13,7 @@ use {
         sync::{mpsc, mpsc::TryRecvError},
         time::{Duration, Instant},
     },
+    tonic::transport::Channel,
 };
 
 #[derive(Clone)]
@@ -76,6 +77,7 @@ pub struct App {
     clipboard_notice_rx: mpsc::Receiver<String>,
     paste_notice: Option<(String, Instant)>,
     file_job_tx: Option<mpsc::SyncSender<FileJob>>,
+    grpc_channel: Option<Channel>,
     last_session_token: Option<String>,
     last_grpc_session_token: Option<String>,
     last_public_base_url: Option<String>,
@@ -145,6 +147,7 @@ impl App {
             paste_notice: None,
             clipboard_notice_rx,
             file_job_tx,
+            grpc_channel: None,
             last_session_token: None,
             last_grpc_session_token: None,
             last_public_base_url: None,
@@ -174,6 +177,7 @@ impl App {
         self.last_session_token = None;
         self.last_grpc_session_token = None;
         self.last_public_base_url = None;
+        self.grpc_channel = None;
         self.revoke_state = RevokeState::Idle;
     }
 
@@ -353,6 +357,9 @@ impl eframe::App for App {
                             self.last_connect_status = None;
                             self.state = AppState::Error { message };
                         }
+                        ClientEvent::GrpcChannel { channel } => {
+                            self.grpc_channel = Some(channel);
+                        }
                         ClientEvent::FileReceived(file) => {
                             if let Some(ref tx) = self.file_job_tx {
                                 let job = FileJob {
@@ -372,6 +379,7 @@ impl eframe::App for App {
                                         .clone(),
                                     paste_delay_ms: self.config.paste_delay_ms,
                                     key_after_paste_delay_ms: self.config.key_after_paste_delay_ms,
+                                    grpc_channel: self.grpc_channel.clone(),
                                 };
                                 if tx.try_send(job).is_err() {
                                     tracing::warn!("文件任务队列已满，本次文件已丢弃");

@@ -6,18 +6,80 @@
 //! pairing 级别的文件生命周期管理。
 
 use {
+    bytes::Bytes,
     dashmap::DashMap,
     rand::RngExt,
     sha2::Sha256,
     std::{
         path::{Path, PathBuf},
-        sync::{Arc, Mutex},
+        sync::{
+            Arc,
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         time::Instant,
     },
-    tokio::io::AsyncWriteExt,
+    tokio::{
+        io::AsyncWriteExt,
+        sync::mpsc::{Receiver, Sender},
+    },
     tracing::{info, warn},
     uuid::Uuid,
 };
+
+/// gRPC 流式推送的单个传输单元。
+///
+/// STREAMING 路径下，upload handler 按顺序发送 `Data` 帧，
+/// 最后发送 `End` 或 `Abort` 终止帧。
+#[derive(Debug)]
+pub enum StreamItem {
+    /// 文件数据块。
+    Data(Bytes),
+    /// 正常终止帧，携带完整文件的 SHA-256 摘要（32 字节原始数据）。
+    End { sha256: [u8; 32] },
+    /// 异常中止帧，携带可读的错误原因。
+    Abort { reason: String },
+}
+
+/// STREAMING 路径的单文件流状态，存储在 `UploadStore::streaming_states` 中。
+struct StreamingState {
+    /// 发送端，由 upload handler 持有并推送数据帧。
+    tx: Sender<StreamItem>,
+    /// 接收端，`attach_stream()` 调用时被 take 走交给 gRPC handler。
+    rx: Option<Receiver<StreamItem>>,
+    /// 是否已被 gRPC handler attach（原子量，防止重复 attach）。
+    attached: AtomicBool,
+}
+
+/// `attach_stream()` 可能返回的错误类型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachError {
+    /// 指定 file_id 没有对应的 StreamingState。
+    NotFound,
+    /// 该 file_id 的流已被另一个 gRPC handler attach。
+    AlreadyAttached,
+}
+
+/// `send_chunk()` 的返回值，指示发送结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendChunkResult {
+    /// 发送成功。
+    Ok,
+    /// Receiver 已关闭（gRPC handler 断连）。
+    Disconnected,
+    /// 5 秒内未能成功发送（backpressure 超时）。
+    Timeout,
+}
+
+/// `send_end` / `send_abort` 的发送结果。
+pub enum SendTerminalResult {
+    /// 终态帧已送达 receiver。
+    Sent,
+    /// Receiver 已关闭（gRPC handler 断连），终态帧未送达。
+    Disconnected,
+    /// 5 秒内 channel 未就绪，终态帧未送达。
+    Timeout,
+}
 
 /// 文件在服务端生命周期内的状态流转。
 ///
@@ -52,6 +114,7 @@ pub struct FileMeta {
     /// 文件当前状态。
     pub status: FileStatus,
     /// 文件写入完成的时刻（`Uploading` 期间为占位时刻，完成后不更新）。
+    #[allow(dead_code)]
     pub uploaded_at: Instant,
     /// 磁盘文件路径（在 `StoredUnnotified` 之后有效）。
     pub file_path: PathBuf,
@@ -62,6 +125,7 @@ pub struct FileMeta {
     /// 清洗后的安全文件名（用于磁盘存储和客户端保存路径）。
     pub file_name: String,
     /// 客户端上传时提供的原始文件名（未清洗，仅用于向上传方回显）。
+    #[allow(dead_code)]
     pub raw_filename: String,
     /// MIME 类型。
     pub mime_type: String,
@@ -167,6 +231,8 @@ pub struct UploadStore {
     max_pending_upload_files_per_pairing: u32,
     max_pending_upload_files_global: u32,
     max_pending_upload_bytes_global: u64,
+    /// STREAMING 路径：file_id → 流状态（发送/接收端 + attached 标志）。
+    streaming_states: DashMap<Uuid, StreamingState>,
 }
 
 impl UploadStore {
@@ -184,175 +250,8 @@ impl UploadStore {
             max_pending_upload_files_per_pairing,
             max_pending_upload_files_global,
             max_pending_upload_bytes_global,
+            streaming_states: DashMap::new(),
         })
-    }
-
-    /// 流式接收上传文件并写入磁盘，同步计算 SHA-256。
-    ///
-    /// # 并发安全
-    ///
-    /// "检查 + 占位"在同一 Mutex 临界区内原子完成，防止并发请求绕过容量上限。
-    /// 占位后释放锁，再执行磁盘 I/O（不持锁跨越 await）。
-    /// 写入失败时自动回滚计数器并删除临时文件。
-    pub async fn save_file(
-        &self,
-        upload_dir: &Path,
-        pairing_id: Uuid,
-        mut stream: axum::extract::Multipart,
-        max_upload_size_bytes: u64,
-        chunk_timeout: std::time::Duration,
-    ) -> Result<(Uuid, FileMeta), SaveFileError> {
-        let file_id = Uuid::new_v4();
-
-        let field = match stream
-            .next_field()
-            .await
-            .map_err(|e| SaveFileError::Io(format!("multipart 读取失败: {e}")))?
-        {
-            Some(f) => f,
-            None => return Err(SaveFileError::NoFileField),
-        };
-
-        let raw_filename = field.file_name().unwrap_or_default().to_string();
-        let file_name = sanitize_file_name(&raw_filename, &file_id);
-        let mime_type = field
-            .content_type()
-            .map(|ct| ct.to_string())
-            .unwrap_or_else(|| {
-                mime_guess::from_path(&file_name)
-                    .first_or_octet_stream()
-                    .to_string()
-            });
-
-        // 在同一 Mutex 临界区内原子执行"检查 + 占位"，防止并发绕过配额。
-        {
-            let mut res = self.reservation.lock().unwrap();
-
-            if res.is_pairing_closed(pairing_id) {
-                return Err(SaveFileError::Limit(UploadLimitError::PairingClosed));
-            }
-
-            let per_pairing_count = res.count_pending_for_pairing(pairing_id);
-            if per_pairing_count >= self.max_pending_upload_files_per_pairing {
-                return Err(SaveFileError::Limit(
-                    UploadLimitError::PerPairingFileLimitReached,
-                ));
-            }
-
-            if res.global_pending_files >= self.max_pending_upload_files_global {
-                return Err(SaveFileError::Limit(
-                    UploadLimitError::GlobalFileLimitReached,
-                ));
-            }
-
-            if res
-                .global_pending_bytes
-                .checked_add(self.max_upload_size_bytes)
-                .is_none_or(|v| v > self.max_pending_upload_bytes_global)
-            {
-                return Err(SaveFileError::Limit(
-                    UploadLimitError::GlobalByteLimitReached,
-                ));
-            }
-
-            let meta = FileMeta {
-                pairing_id,
-                status: FileStatus::Uploading,
-                uploaded_at: Instant::now(),
-                file_path: PathBuf::new(),
-                size_bytes: self.max_upload_size_bytes,
-                file_access_token: [0u8; 32],
-                file_name: file_name.clone(),
-                raw_filename: raw_filename.clone(),
-                mime_type: mime_type.clone(),
-                sha256: String::new(),
-            };
-            self.files.insert(file_id, meta);
-            res.reserve(file_id, pairing_id, self.max_upload_size_bytes);
-        }
-
-        // Mutex 已释放，执行磁盘 I/O。
-        let tmp_name = format!(".{file_id}.tmp");
-        let tmp_path = upload_dir.join(&tmp_name);
-
-        let result = self
-            .write_stream_to_file(&tmp_path, field, max_upload_size_bytes, chunk_timeout)
-            .await;
-
-        if result.is_ok()
-            && let Ok(Some(_)) = stream.next_field().await
-        {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            self.rollback_upload(file_id, pairing_id);
-            return Err(SaveFileError::TooManyFields);
-        }
-
-        match result {
-            Ok((actual_size, sha256_hex)) => {
-                let mut token = [0u8; 32];
-                rand::rng().fill(&mut token);
-                let final_path = upload_dir.join(file_id.to_string());
-                if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
-                    warn!("重命名临时文件失败 file_id={file_id}: {e}");
-                    let _ = tokio::fs::remove_file(&tmp_path).await;
-                    self.rollback_upload(file_id, pairing_id);
-                    return Err(SaveFileError::Io(format!("重命名失败: {e}")));
-                }
-
-                // 写盘成功后，在 Mutex 保护下二次检查 pairing 是否已关闭（High-3 修复）。
-                let pairing_closed = {
-                    let mut res = self.reservation.lock().unwrap();
-                    if res.is_pairing_closed(pairing_id) {
-                        let old_reserved = self
-                            .files
-                            .remove(&file_id)
-                            .map(|(_, m)| m.size_bytes)
-                            .unwrap_or(self.max_upload_size_bytes);
-                        res.release(file_id, pairing_id, old_reserved);
-                        true
-                    } else {
-                        if let Some(mut entry) = self.files.get_mut(&file_id) {
-                            let old_reserved = entry.size_bytes;
-                            entry.status = FileStatus::StoredUnnotified;
-                            entry.file_path = final_path.clone();
-                            entry.size_bytes = actual_size;
-                            entry.file_access_token = token;
-                            entry.sha256 = sha256_hex.clone();
-                            res.correct_bytes(old_reserved, actual_size);
-                        }
-                        false
-                    }
-                };
-
-                if pairing_closed {
-                    let _ = tokio::fs::remove_file(&final_path).await;
-                    return Err(SaveFileError::Limit(UploadLimitError::PairingClosed));
-                }
-
-                let meta_snapshot = self.files.get(&file_id).map(|e| FileMeta {
-                    pairing_id: e.pairing_id,
-                    status: e.status.clone(),
-                    uploaded_at: e.uploaded_at,
-                    file_path: e.file_path.clone(),
-                    size_bytes: e.size_bytes,
-                    file_access_token: e.file_access_token,
-                    file_name: e.file_name.clone(),
-                    raw_filename: e.raw_filename.clone(),
-                    mime_type: e.mime_type.clone(),
-                    sha256: e.sha256.clone(),
-                });
-                if let Some(meta) = meta_snapshot {
-                    Ok((file_id, meta))
-                } else {
-                    Err(SaveFileError::Io("内存记录丢失".to_string()))
-                }
-            }
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-                self.rollback_upload(file_id, pairing_id);
-                Err(e)
-            }
-        }
     }
 
     async fn write_stream_to_file(
@@ -407,7 +306,10 @@ impl UploadStore {
     }
 
     /// 回滚上传占位：从内存索引中移除文件记录并还原全局计数器。
-    fn rollback_upload(&self, file_id: Uuid, pairing_id: Uuid) {
+    ///
+    /// 同时幂等清理可能残留的 StreamingState（STREAMING 路径失败时的 orphan 清理）。
+    pub fn rollback_upload(&self, file_id: Uuid, pairing_id: Uuid) {
+        self.streaming_states.remove(&file_id);
         let reserved_bytes = self
             .files
             .remove(&file_id)
@@ -542,8 +444,9 @@ impl UploadStore {
 
     /// 立即删除单个文件并同步减少全局计数。
     ///
-    /// 用于 ACK 收到后的主动清理路径。
+    /// 用于 ACK 收到后的主动清理路径。同时幂等清理可能残留的 StreamingState。
     pub fn remove_file(&self, file_id: Uuid) {
+        self.streaming_states.remove(&file_id);
         if let Some((_, meta)) = self.files.remove(&file_id) {
             {
                 let mut res = self.reservation.lock().unwrap();
@@ -640,12 +543,14 @@ impl UploadStore {
                 }
 
                 if let Some((_, m)) = self.files.remove(&fid) {
+                    self.streaming_states.remove(&fid);
                     {
                         let mut res = self.reservation.lock().unwrap();
                         res.release(fid, m.pairing_id, m.size_bytes);
                     }
                     info!("cleanup_expired 删除超时文件 file_id={fid} age={age_secs}s");
                 } else {
+                    self.streaming_states.remove(&fid);
                     // 孤儿文件，不调整计数器。
                     info!(
                         "cleanup_expired 删除孤儿文件 path={} age={age_secs}s",
@@ -768,6 +673,269 @@ impl UploadStore {
             accepted_bytes,
         }
     }
+
+    /// 在 Mutex 临界区内完成配额检查、file_id 生成、file_access_token 生成，并将 FileMeta
+    /// 以 `FileStatus::Uploading` 状态注册到内存索引。
+    ///
+    /// 调用方应在此返回后再获取 multipart Field 并决定走 STREAMING 还是 RELAY 路径。
+    ///
+    /// # 返回
+    ///
+    /// 成功时返回 `(file_id, file_access_token, sanitized_file_name)`。
+    pub fn begin_upload(
+        &self,
+        pairing_id: Uuid,
+        raw_filename: &str,
+        mime_type: String,
+    ) -> Result<(Uuid, [u8; 32], String), SaveFileError> {
+        let file_id = Uuid::new_v4();
+        let file_name = sanitize_file_name(raw_filename, &file_id);
+
+        let mut token = [0u8; 32];
+        let mut res = self.reservation.lock().unwrap();
+
+        if res.is_pairing_closed(pairing_id) {
+            return Err(SaveFileError::Limit(UploadLimitError::PairingClosed));
+        }
+
+        let per_pairing_count = res.count_pending_for_pairing(pairing_id);
+        if per_pairing_count >= self.max_pending_upload_files_per_pairing {
+            return Err(SaveFileError::Limit(
+                UploadLimitError::PerPairingFileLimitReached,
+            ));
+        }
+
+        if res.global_pending_files >= self.max_pending_upload_files_global {
+            return Err(SaveFileError::Limit(
+                UploadLimitError::GlobalFileLimitReached,
+            ));
+        }
+
+        if res
+            .global_pending_bytes
+            .checked_add(self.max_upload_size_bytes)
+            .is_none_or(|v| v > self.max_pending_upload_bytes_global)
+        {
+            return Err(SaveFileError::Limit(
+                UploadLimitError::GlobalByteLimitReached,
+            ));
+        }
+
+        // 在 Mutex 临界区内生成 CSPRNG token（不依赖时间戳或自增 ID）。
+        rand::rng().fill(&mut token);
+
+        let meta = FileMeta {
+            pairing_id,
+            status: FileStatus::Uploading,
+            uploaded_at: Instant::now(),
+            file_path: PathBuf::new(),
+            size_bytes: self.max_upload_size_bytes,
+            file_access_token: token,
+            file_name: file_name.clone(),
+            raw_filename: raw_filename.to_string(),
+            mime_type,
+            sha256: String::new(),
+        };
+        self.files.insert(file_id, meta);
+        res.reserve(file_id, pairing_id, self.max_upload_size_bytes);
+
+        Ok((file_id, token, file_name))
+    }
+
+    /// 为指定 file_id 创建新的 StreamingState（mpsc channel 容量 4）。
+    ///
+    /// 若同一 file_id 已存在 StreamingState（僵尸），先清理再插入新的。
+    pub fn create_streaming_state(&self, file_id: Uuid) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let state = StreamingState {
+            tx,
+            rx: Some(rx),
+            attached: AtomicBool::new(false),
+        };
+        self.streaming_states.insert(file_id, state);
+    }
+
+    /// 将 Receiver 从 StreamingState 取走并返回给 gRPC handler。
+    ///
+    /// 通过 `AtomicBool::compare_exchange` 原子标记 attached，防止重复 attach。
+    pub fn attach_stream(&self, file_id: Uuid) -> Result<Receiver<StreamItem>, AttachError> {
+        let mut entry = self
+            .streaming_states
+            .get_mut(&file_id)
+            .ok_or(AttachError::NotFound)?;
+
+        entry
+            .attached
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AttachError::AlreadyAttached)?;
+
+        let rx = entry
+            .rx
+            .take()
+            .expect("rx must be Some when attached=false");
+        Ok(rx)
+    }
+
+    /// 向 STREAMING 通道发送一个数据块，带 5 秒 backpressure 超时。
+    pub async fn send_chunk(&self, file_id: Uuid, data: Bytes) -> SendChunkResult {
+        let tx = {
+            let entry = match self.streaming_states.get(&file_id) {
+                Some(e) => e,
+                None => return SendChunkResult::Disconnected,
+            };
+            entry.tx.clone()
+        };
+
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tx.send(StreamItem::Data(data)),
+        )
+        .await
+        {
+            Ok(Ok(())) => SendChunkResult::Ok,
+            Ok(Err(_)) => SendChunkResult::Disconnected,
+            Err(_) => SendChunkResult::Timeout,
+        }
+    }
+
+    /// STREAMING 路径上传完成后调用：将 FileStatus 直接从 Uploading 置为 Notified，
+    /// 并更新 file_path、size_bytes、sha256。
+    pub fn mark_streaming_done(
+        &self,
+        file_id: Uuid,
+        final_path: PathBuf,
+        actual_size: u64,
+        sha256: [u8; 32],
+    ) {
+        if let Some(mut entry) = self.files.get_mut(&file_id) {
+            let old_reserved = entry.size_bytes;
+            entry.status = FileStatus::Notified;
+            entry.file_path = final_path;
+            entry.size_bytes = actual_size;
+            entry.sha256 = sha256.iter().map(|b| format!("{b:02x}")).collect();
+            let mut res = self.reservation.lock().unwrap();
+            res.correct_bytes(old_reserved, actual_size);
+        }
+    }
+
+    /// 发送正常终止信号；streaming_state 由 gRPC handler 在流结束后负责移除。
+    ///
+    /// 即使发送失败（receiver 已关闭或 5 秒 backpressure 超时），也保证状态一致。
+    pub async fn send_end(&self, file_id: Uuid, sha256: [u8; 32]) -> SendTerminalResult {
+        let tx = self
+            .streaming_states
+            .get(&file_id)
+            .map(|entry| entry.tx.clone());
+        if let Some(tx) = tx {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tx.send(StreamItem::End { sha256 }),
+            )
+            .await
+            {
+                Ok(Ok(())) => SendTerminalResult::Sent,
+                Ok(Err(_)) => SendTerminalResult::Disconnected,
+                Err(_) => SendTerminalResult::Timeout,
+            }
+        } else {
+            SendTerminalResult::Disconnected
+        }
+    }
+
+    /// 发送异常中止信号；streaming_state 由 gRPC handler 在流结束后负责移除。
+    ///
+    /// 即使发送失败（receiver 已关闭或 5 秒 backpressure 超时），也保证状态一致。
+    pub async fn send_abort(&self, file_id: Uuid, reason: String) -> SendTerminalResult {
+        let tx = self
+            .streaming_states
+            .get(&file_id)
+            .map(|entry| entry.tx.clone());
+        if let Some(tx) = tx {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tx.send(StreamItem::Abort { reason }),
+            )
+            .await
+            {
+                Ok(Ok(())) => SendTerminalResult::Sent,
+                Ok(Err(_)) => SendTerminalResult::Disconnected,
+                Err(_) => SendTerminalResult::Timeout,
+            }
+        } else {
+            SendTerminalResult::Disconnected
+        }
+    }
+
+    /// 幂等清理 StreamingState（不 panic，多次调用安全）。
+    pub fn remove_streaming_state(&self, file_id: Uuid) { self.streaming_states.remove(&file_id); }
+
+    /// RELAY 路径：接受外部已解析好的 multipart Field，
+    /// 写盘、计算 SHA-256，将状态从 Uploading 更新为 StoredUnnotified。
+    ///
+    /// file_id 和 file_access_token 必须已由调用方在 Mutex 临界区内生成并注册到 FileMeta。
+    pub async fn save_file_from_field(
+        &self,
+        upload_dir: &Path,
+        file_id: Uuid,
+        pairing_id: Uuid,
+        field: axum::extract::multipart::Field<'_>,
+        max_bytes: u64,
+        chunk_timeout: std::time::Duration,
+    ) -> Result<(), SaveFileError> {
+        let tmp_name = format!(".{file_id}.tmp");
+        let tmp_path = upload_dir.join(&tmp_name);
+
+        let result = self
+            .write_stream_to_file(&tmp_path, field, max_bytes, chunk_timeout)
+            .await;
+
+        match result {
+            Ok((actual_size, sha256_hex)) => {
+                let final_path = upload_dir.join(file_id.to_string());
+                if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+                    warn!("重命名临时文件失败 file_id={file_id}: {e}");
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    self.rollback_upload(file_id, pairing_id);
+                    return Err(SaveFileError::Io(format!("重命名失败: {e}")));
+                }
+
+                let pairing_closed = {
+                    let mut res = self.reservation.lock().unwrap();
+                    if res.is_pairing_closed(pairing_id) {
+                        let old_reserved = self
+                            .files
+                            .remove(&file_id)
+                            .map(|(_, m)| m.size_bytes)
+                            .unwrap_or(self.max_upload_size_bytes);
+                        res.release(file_id, pairing_id, old_reserved);
+                        true
+                    } else {
+                        if let Some(mut entry) = self.files.get_mut(&file_id) {
+                            let old_reserved = entry.size_bytes;
+                            entry.status = FileStatus::StoredUnnotified;
+                            entry.file_path = final_path.clone();
+                            entry.size_bytes = actual_size;
+                            entry.sha256 = sha256_hex.clone();
+                            res.correct_bytes(old_reserved, actual_size);
+                        }
+                        false
+                    }
+                };
+
+                if pairing_closed {
+                    let _ = tokio::fs::remove_file(&final_path).await;
+                    return Err(SaveFileError::Limit(UploadLimitError::PairingClosed));
+                }
+
+                Ok(())
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                self.rollback_upload(file_id, pairing_id);
+                Err(e)
+            }
+        }
+    }
 }
 
 /// `UploadStore::get_file_meta` 返回的文件元数据快照（避免持有 DashMap 引用）。
@@ -812,10 +980,6 @@ pub enum SaveFileError {
     Io(String),
     /// 文件超过大小上限（流式截断）。
     TooLarge,
-    /// multipart 中未找到文件字段。
-    NoFileField,
-    /// multipart 中包含多余字段（只允许一个文件 part）。
-    TooManyFields,
     /// 上传超时（chunk 间隔超过允许时限）。
     Timeout,
 }
@@ -904,4 +1068,345 @@ pub fn sanitize_file_name(raw: &str, fallback_id: &Uuid) -> String {
         }
     }
     format!("{truncated}{ext}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store_limit_1() -> Arc<UploadStore> { UploadStore::new(1024 * 1024 * 1024, 10, 1, u64::MAX) }
+
+    fn store_loose() -> Arc<UploadStore> { UploadStore::new(1024 * 1024, 10, 100, u64::MAX) }
+
+    #[test]
+    fn quota_lifecycle_begin_upload_occupies_quota() {
+        let store = store_limit_1();
+        let pairing_id = Uuid::new_v4();
+
+        assert!(
+            store
+                .begin_upload(pairing_id, "file.txt", "text/plain".to_string())
+                .is_ok()
+        );
+
+        let result = store.begin_upload(pairing_id, "file2.txt", "text/plain".to_string());
+        assert!(
+            matches!(
+                result,
+                Err(SaveFileError::Limit(
+                    UploadLimitError::GlobalFileLimitReached
+                ))
+            ),
+            "second begin_upload should fail with GlobalFileLimitReached, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn quota_lifecycle_rollback_releases_quota() {
+        let store = store_limit_1();
+        let pairing_id = Uuid::new_v4();
+
+        let (file_id, ..) = store
+            .begin_upload(pairing_id, "file.txt", "text/plain".to_string())
+            .unwrap();
+
+        store.rollback_upload(file_id, pairing_id);
+
+        assert!(
+            store
+                .begin_upload(pairing_id, "file2.txt", "text/plain".to_string())
+                .is_ok(),
+            "after rollback quota should be released"
+        );
+    }
+
+    #[test]
+    fn quota_lifecycle_streaming_done_keeps_quota() {
+        let store = store_limit_1();
+        let pairing_id = Uuid::new_v4();
+
+        let (file_id, ..) = store
+            .begin_upload(pairing_id, "file.txt", "text/plain".to_string())
+            .unwrap();
+
+        store.mark_streaming_done(file_id, PathBuf::from("/tmp/fake"), 1024, [0u8; 32]);
+
+        let result = store.begin_upload(pairing_id, "file2.txt", "text/plain".to_string());
+        assert!(
+            matches!(
+                result,
+                Err(SaveFileError::Limit(
+                    UploadLimitError::GlobalFileLimitReached
+                ))
+            ),
+            "after mark_streaming_done quota should still be occupied"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_lifecycle_remove_file_releases_quota() {
+        let store = store_limit_1();
+        let pairing_id = Uuid::new_v4();
+
+        let (file_id, ..) = store
+            .begin_upload(pairing_id, "file.txt", "text/plain".to_string())
+            .unwrap();
+
+        store.remove_file(file_id);
+
+        assert!(
+            store
+                .begin_upload(pairing_id, "file2.txt", "text/plain".to_string())
+                .is_ok(),
+            "after remove_file quota should be released"
+        );
+    }
+
+    #[test]
+    fn streaming_state_remove_idempotent() {
+        let store = store_loose();
+        let file_id = Uuid::new_v4();
+
+        store.create_streaming_state(file_id);
+        store.remove_streaming_state(file_id);
+        store.remove_streaming_state(file_id);
+
+        store.remove_streaming_state(Uuid::new_v4());
+    }
+
+    #[test]
+    fn streaming_state_attach_succeeds_once() {
+        let store = store_loose();
+        let file_id = Uuid::new_v4();
+
+        store.create_streaming_state(file_id);
+
+        assert!(store.attach_stream(file_id).is_ok());
+        assert!(matches!(
+            store.attach_stream(file_id),
+            Err(AttachError::AlreadyAttached)
+        ));
+    }
+
+    #[test]
+    fn streaming_state_attach_not_found() {
+        let store = store_loose();
+        assert!(matches!(
+            store.attach_stream(Uuid::new_v4()),
+            Err(AttachError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn streaming_state_cleanup_after_file_received_failure() {
+        let store = store_loose();
+        let file_id = Uuid::new_v4();
+
+        store.create_streaming_state(file_id);
+        store.remove_streaming_state(file_id);
+
+        assert!(matches!(
+            store.attach_stream(file_id),
+            Err(AttachError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_state_cleanup_after_send_abort() {
+        let store = store_loose();
+        let file_id = Uuid::new_v4();
+
+        store.create_streaming_state(file_id);
+        let _rx = store.attach_stream(file_id).unwrap();
+        store.send_abort(file_id, "test_reason".to_string()).await;
+
+        // send_abort 不移除状态；由 stream_file gRPC handler 结束时显式清理。
+        // attach 应返回 AlreadyAttached（状态仍在），而非 NotFound（状态已移除）。
+        assert!(matches!(
+            store.attach_stream(file_id),
+            Err(AttachError::AlreadyAttached)
+        ));
+
+        store.remove_streaming_state(file_id);
+        assert!(matches!(
+            store.attach_stream(file_id),
+            Err(AttachError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_state_cleanup_after_send_end() {
+        let store = store_loose();
+        let file_id = Uuid::new_v4();
+
+        store.create_streaming_state(file_id);
+        store.send_end(file_id, [0u8; 32]).await;
+
+        // send_end 不移除状态；由 stream_file gRPC handler 结束时显式清理。
+        // 状态仍在，但 rx 尚未被 attach，因此还可以 attach（不过 channel 已关闭）。
+        assert!(
+            store.attach_stream(file_id).is_ok()
+                || matches!(
+                    store.attach_stream(file_id),
+                    Err(AttachError::AlreadyAttached)
+                ),
+            "state should still exist after send_end"
+        );
+
+        store.remove_streaming_state(file_id);
+        assert!(matches!(
+            store.attach_stream(file_id),
+            Err(AttachError::NotFound)
+        ));
+    }
+
+    // ── 7.1: 并发 attach 测试 ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn streaming_concurrent_attach_only_one_succeeds() {
+        let store = store_loose();
+        let file_id = Uuid::new_v4();
+        store.create_streaming_state(file_id);
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let s = Arc::clone(&store);
+            handles.push(tokio::spawn(async move { s.attach_stream(file_id) }));
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.expect("task should not panic"))
+            .collect();
+
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let already_attached_count = results
+            .iter()
+            .filter(|r| matches!(r, Err(AttachError::AlreadyAttached)))
+            .count();
+
+        assert_eq!(ok_count, 1, "exactly one attach should succeed");
+        assert_eq!(
+            already_attached_count, 9,
+            "remaining 9 should be AlreadyAttached"
+        );
+    }
+
+    // ── 7.4b: token 唯一性 ─────────────────────────────────────────────────
+
+    #[test]
+    fn begin_upload_generates_unique_tokens() {
+        let store = store_loose();
+        let p = Uuid::new_v4();
+        let (_, token1, _) = store
+            .begin_upload(p, "a.txt", "text/plain".to_string())
+            .unwrap();
+        let (_, token2, _) = store
+            .begin_upload(p, "b.txt", "text/plain".to_string())
+            .unwrap();
+        assert_ne!(token1, token2, "tokens must be unique");
+    }
+
+    // ── 7.5: 配额测试 ─────────────────────────────────────────────────────
+
+    #[test]
+    fn quota_global_file_limit_rollback_then_reuse() {
+        let store = store_limit_1();
+        let pairing_id = Uuid::new_v4();
+
+        let (file_id, ..) = store
+            .begin_upload(pairing_id, "file.txt", "text/plain".to_string())
+            .unwrap();
+
+        // 第二次超限
+        assert!(matches!(
+            store.begin_upload(pairing_id, "file2.txt", "text/plain".to_string()),
+            Err(SaveFileError::Limit(
+                UploadLimitError::GlobalFileLimitReached
+            ))
+        ));
+
+        // rollback 后配额释放，可再次成功
+        store.rollback_upload(file_id, pairing_id);
+        assert!(
+            store
+                .begin_upload(pairing_id, "file3.txt", "text/plain".to_string())
+                .is_ok(),
+            "after rollback quota should be freed for reuse"
+        );
+    }
+
+    #[test]
+    fn quota_byte_limit_enforced() {
+        // max_upload_size_bytes=30 → 每次悲观预留 30 字节
+        // max_pending_upload_bytes_global=50 → 第一次 30 ≤ 50 OK，第二次 30+30=60 > 50 FAIL
+        let store = UploadStore::new(30, 10, 100, 50);
+        let p = Uuid::new_v4();
+
+        assert!(
+            store
+                .begin_upload(p, "a.txt", "text/plain".to_string())
+                .is_ok(),
+            "first upload (30 bytes reserved) should fit within 50-byte global limit"
+        );
+
+        let result = store.begin_upload(p, "b.txt", "text/plain".to_string());
+        assert!(
+            matches!(
+                result,
+                Err(SaveFileError::Limit(
+                    UploadLimitError::GlobalByteLimitReached
+                ))
+            ),
+            "second upload should exceed global byte limit, got {result:?}"
+        );
+    }
+
+    // ── 7.6: 错误状态码矩阵 ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn streaming_state_removed_after_send_abort_without_attach() {
+        let store = store_loose();
+        let file_id = Uuid::new_v4();
+        store.create_streaming_state(file_id);
+
+        // 不调用 attach_stream，直接 send_abort
+        store.send_abort(file_id, "io_error".to_string()).await;
+
+        // send_abort 不再自动移除状态（由 gRPC handler 结束时清理）。
+        // 此路径（never-attached）下通过 rollback_upload 或 remove_streaming_state 兜底。
+        store.remove_streaming_state(file_id);
+        assert!(
+            matches!(store.attach_stream(file_id), Err(AttachError::NotFound)),
+            "streaming state should be removed after explicit remove_streaming_state"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_chunk_disconnected_when_no_receiver() {
+        let store = store_loose();
+        let file_id = Uuid::new_v4();
+        store.create_streaming_state(file_id);
+
+        let rx = store.attach_stream(file_id).unwrap();
+        drop(rx);
+
+        let result = store.send_chunk(file_id, Bytes::from("data")).await;
+        assert_eq!(result, SendChunkResult::Disconnected);
+    }
+
+    #[test]
+    fn mark_streaming_done_sets_status_to_notified() {
+        let store = store_loose();
+        let pairing_id = Uuid::new_v4();
+        let (file_id, ..) = store
+            .begin_upload(pairing_id, "f.txt", "text/plain".to_string())
+            .unwrap();
+
+        store.mark_streaming_done(file_id, PathBuf::from("/tmp/x"), 1024, [0u8; 32]);
+
+        let meta = store.get_file_meta(file_id).unwrap();
+        assert_eq!(meta.status, FileStatus::Notified);
+    }
 }

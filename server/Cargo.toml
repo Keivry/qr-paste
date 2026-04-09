@@ -10,8 +10,10 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0"
+async-stream = "0.3"
 axum = { version = "0.8", features = ["ws", "multipart"] }
 base64 = "0.22"
+bytes = "1"
 common = { path = "../common" }
 dashmap = "6.1"
 futures = "0.3"
