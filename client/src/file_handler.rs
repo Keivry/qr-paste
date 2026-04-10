@@ -30,9 +30,8 @@ pub struct FileJob {
     pub paste_delay_ms: u64,
     pub key_after_paste_delay_ms: u64,
     pub grpc_channel: Option<Channel>,
-    /// 文件保存锁：序列化"选择目标路径 + rename"步骤，避免并发 worker 产生文件名冲突。
     pub file_save_lock: Arc<Mutex<()>>,
-    /// 图片剪贴板粘贴锁：序列化"写剪贴板 + 模拟按键"步骤，避免并发 worker 相互打架。
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub paste_lock: Arc<Mutex<()>>,
 }
 
@@ -47,17 +46,19 @@ pub fn start_file_workers(
         let job_rx = Arc::clone(&job_rx);
         let notice_tx = notice_tx.clone();
         let repaint_ctx = repaint_ctx.clone();
-        std::thread::spawn(move || loop {
-            let job = {
-                let rx = job_rx.lock().unwrap();
-                match rx.recv() {
-                    Ok(job) => job,
-                    Err(_) => break,
-                }
-            };
-            let notice = process_file_job(job);
-            let _ = notice_tx.send(notice);
-            repaint_ctx.request_repaint();
+        std::thread::spawn(move || {
+            loop {
+                let job = {
+                    let rx = job_rx.lock().unwrap();
+                    match rx.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    }
+                };
+                let notice = process_file_job(job);
+                let _ = notice_tx.send(notice);
+                repaint_ctx.request_repaint();
+            }
         });
     }
 }
@@ -104,7 +105,13 @@ fn process_file_job(job: FileJob) -> String {
                     }
                 }
 
-                match persist_tmp_locked(&tmp_path, &job.file_save_dir, &file_name, total_bytes, &job.file_save_lock) {
+                match persist_tmp_locked(
+                    &tmp_path,
+                    &job.file_save_dir,
+                    &file_name,
+                    total_bytes,
+                    &job.file_save_lock,
+                ) {
                     Ok(notice) => {
                         send_ack(&client, event, &job.public_base_url, true);
                         return notice;
@@ -148,8 +155,13 @@ fn process_file_job(job: FileJob) -> String {
                         }
                     }
 
-                    match persist_tmp_locked(&tmp_path, &job.file_save_dir, &file_name, total_bytes, &job.file_save_lock)
-                    {
+                    match persist_tmp_locked(
+                        &tmp_path,
+                        &job.file_save_dir,
+                        &file_name,
+                        total_bytes,
+                        &job.file_save_lock,
+                    ) {
                         Ok(notice) => {
                             send_ack(&client, event, &job.public_base_url, true);
                             return notice;
@@ -241,7 +253,13 @@ fn process_file_save_job(
     file_name: &str,
 ) -> Result<String, DownloadError> {
     let (tmp_path, total_bytes) = try_download(client, &job.event, bearer, &job.file_save_dir)?;
-    persist_tmp_locked(&tmp_path, &job.file_save_dir, file_name, total_bytes, &job.file_save_lock)
+    persist_tmp_locked(
+        &tmp_path,
+        &job.file_save_dir,
+        file_name,
+        total_bytes,
+        &job.file_save_lock,
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -273,7 +291,13 @@ fn process_image_from_tmp(
                 error = %err,
                 "图片格式嗅探失败，回退为文件保存"
             );
-            return persist_tmp_locked(&tmp_path, save_dir, file_name, total_bytes, &job.file_save_lock);
+            return persist_tmp_locked(
+                &tmp_path,
+                save_dir,
+                file_name,
+                total_bytes,
+                &job.file_save_lock,
+            );
         }
     };
 
@@ -286,7 +310,13 @@ fn process_image_from_tmp(
                 error = %err,
                 "图片尺寸探测失败，回退为文件保存"
             );
-            return persist_tmp_locked(&tmp_path, save_dir, file_name, total_bytes, &job.file_save_lock);
+            return persist_tmp_locked(
+                &tmp_path,
+                save_dir,
+                file_name,
+                total_bytes,
+                &job.file_save_lock,
+            );
         }
     };
 
@@ -297,7 +327,13 @@ fn process_image_from_tmp(
             height,
             "图片解码内存预估溢出，回退为文件保存"
         );
-        return persist_tmp_locked(&tmp_path, save_dir, file_name, total_bytes, &job.file_save_lock);
+        return persist_tmp_locked(
+            &tmp_path,
+            save_dir,
+            file_name,
+            total_bytes,
+            &job.file_save_lock,
+        );
     };
 
     if decoded_bytes > job.image_clipboard_max_decoded_bytes {
@@ -309,7 +345,13 @@ fn process_image_from_tmp(
             limit = job.image_clipboard_max_decoded_bytes,
             "图片解码内存超过上限，回退为文件保存"
         );
-        return persist_tmp_locked(&tmp_path, save_dir, file_name, total_bytes, &job.file_save_lock);
+        return persist_tmp_locked(
+            &tmp_path,
+            save_dir,
+            file_name,
+            total_bytes,
+            &job.file_save_lock,
+        );
     }
 
     let image = match open_image_reader(&tmp_path)
@@ -323,7 +365,13 @@ fn process_image_from_tmp(
                 error = %err,
                 "图片解码失败，回退为文件保存"
             );
-            return persist_tmp_locked(&tmp_path, save_dir, file_name, total_bytes, &job.file_save_lock);
+            return persist_tmp_locked(
+                &tmp_path,
+                save_dir,
+                file_name,
+                total_bytes,
+                &job.file_save_lock,
+            );
         }
     };
 
@@ -365,7 +413,13 @@ fn process_image_from_tmp(
                 "图片写入剪贴板失败，回退为文件保存"
             );
             drop(_paste_guard);
-            persist_tmp_locked(&tmp_path, save_dir, file_name, total_bytes, &job.file_save_lock)
+            persist_tmp_locked(
+                &tmp_path,
+                save_dir,
+                file_name,
+                total_bytes,
+                &job.file_save_lock,
+            )
         }
     }
 }
