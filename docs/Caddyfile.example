@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+example.com {
+    # WebSocket — must appear before the catch-all handle block.
+    # Caddy handles the Upgrade/Connection headers automatically.
+    handle /ws/mobile/* {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    # Streaming download — disable buffering so bytes reach the client
+    # as they arrive from the backend.
+    @stream path_regexp ^/api/files/[^/]+/stream$
+    handle @stream {
+        reverse_proxy 127.0.0.1:8080 {
+            flush_interval -1
+        }
+    }
+
+    # Catch-all: /m/, /api/pairing/*, /api/files/*, etc.
+    handle {
+        reverse_proxy 127.0.0.1:8080
+    }
+}
+
+grpc.example.com {
+    reverse_proxy 127.0.0.1:50051 {
+        transport http {
+            versions h2c
+        }
+    }
+}

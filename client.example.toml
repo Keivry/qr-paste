@@ -67,9 +67,9 @@ notification_duration_secs = 3
 
 # 接收到文件时的保存目录；不设置则自动使用 %USERPROFILE%\Downloads（Windows 默认下载目录）
 # 路径支持 ~ 前缀，会自动展开为用户主目录
-# 示例（Windows）：file_saved_path = "C:/Users/YourName/Downloads/qr-paste"
-# 示例（Linux/macOS）：file_saved_path = "~/Downloads/qr-paste"
-# file_saved_path = "~/Downloads/qr-paste"
+# 示例（Windows）：file_save_dir = "C:/Users/YourName/Downloads/qr-paste"
+# 示例（Linux/macOS）：file_save_dir = "~/Downloads/qr-paste"
+# file_save_dir = "~/Downloads/qr-paste"
 
 # 文件下载请求超时（秒），默认 60
 # file_download_timeout_secs = 60
