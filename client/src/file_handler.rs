@@ -24,6 +24,7 @@ pub struct FileJob {
     pub download_max_retries: u32,
     pub public_base_url: Option<String>,
     pub auto_paste: bool,
+    pub auto_paste_pic: bool,
     pub mime_type: String,
     pub image_clipboard_max_decoded_bytes: u64,
     pub simulate_key_after_paste: Option<String>,
@@ -86,7 +87,7 @@ fn process_file_job(job: FileJob) -> String {
         match download_via_http_stream(event, &client) {
             Ok((tmp_path, total_bytes)) => {
                 #[cfg(target_os = "windows")]
-                if job.auto_paste && job.mime_type.starts_with("image/") {
+                if job.auto_paste && job.auto_paste_pic && job.mime_type.starts_with("image/") {
                     match process_image_from_tmp(
                         &job,
                         &tmp_path,
@@ -135,7 +136,7 @@ fn process_file_job(job: FileJob) -> String {
             match download_via_grpc_stream(event, channel.clone(), &job.file_save_dir) {
                 Ok((tmp_path, total_bytes)) => {
                     #[cfg(target_os = "windows")]
-                    if job.auto_paste && job.mime_type.starts_with("image/") {
+                    if job.auto_paste && job.auto_paste_pic && job.mime_type.starts_with("image/") {
                         match process_image_from_tmp(
                             &job,
                             &tmp_path,
@@ -190,7 +191,7 @@ fn process_file_job(job: FileJob) -> String {
         let attempt_result = {
             #[cfg(target_os = "windows")]
             {
-                if job.auto_paste && job.mime_type.starts_with("image/") {
+                if job.auto_paste && job.auto_paste_pic && job.mime_type.starts_with("image/") {
                     process_image_job(&job, &client, &bearer, &file_name)
                 } else {
                     process_file_save_job(&job, &client, &bearer, &file_name)
@@ -200,6 +201,7 @@ fn process_file_job(job: FileJob) -> String {
             {
                 let _ = (
                     &job.auto_paste,
+                    &job.auto_paste_pic,
                     &job.mime_type,
                     job.image_clipboard_max_decoded_bytes,
                     &job.simulate_key_after_paste,
@@ -378,13 +380,6 @@ fn process_image_from_tmp(
     let _paste_guard = job.paste_lock.lock().unwrap();
     match write_image_to_clipboard_win32(image) {
         Ok(()) => {
-            if let Err(err) = std::fs::remove_file(&tmp_path) {
-                warn!(
-                    path = %tmp_path.display(),
-                    error = %err,
-                    "图片已写入剪贴板，但删除临时文件失败"
-                );
-            }
             info!(
                 file_name = %file_name,
                 width,
@@ -398,10 +393,25 @@ fn process_image_from_tmp(
             {
                 clipboard::simulate_key(modifier, key, job.key_after_paste_delay_ms);
             }
-            let notice = if let Some(key_spec) = &job.simulate_key_after_paste {
+            let base_notice = if let Some(key_spec) = &job.simulate_key_after_paste {
                 format!("已自动粘贴图片（{key_spec}）：{file_name}")
             } else {
                 format!("已自动粘贴图片：{file_name}")
+            };
+            drop(_paste_guard);
+            // 图片始终保存到 file_save_dir，无论是否自动粘贴
+            let notice = match persist_tmp_locked(
+                tmp_path,
+                save_dir,
+                file_name,
+                total_bytes,
+                &job.file_save_lock,
+            ) {
+                Ok(_) => base_notice,
+                Err(DownloadError::Terminal(msg)) | Err(DownloadError::Transient(msg)) => {
+                    warn!(file_name = %file_name, error = %msg, "图片已粘贴，但保存文件失败");
+                    format!("{base_notice}（保存失败：{msg}）")
+                }
             };
             Ok(notice)
         }

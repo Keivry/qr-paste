@@ -30,6 +30,12 @@ pub struct ClientConfig {
     /// 稳定的客户端配对标识，首次启动时自动生成并写回配置文件。
     pub pairing_id: String,
     pub auto_paste: bool,
+    /// 是否对图片文件执行自动粘贴到剪贴板。默认 `false`。
+    ///
+    /// 仅在 `auto_paste = true` 时生效。当 `auto_paste = true` 且 `auto_paste_pic = true` 时，
+    /// 收到图片文件会写入剪贴板并自动粘贴；否则直接将图片保存到 `file_save_dir`。
+    /// 无论此配置如何，图片文件**始终**会保存到 `file_save_dir`。
+    pub auto_paste_pic: bool,
     /// `auto_paste` 为 `true` 时，粘贴完成后模拟按下的按键。
     ///
     /// 格式示例：`"Return"`、`"Tab"`、`"ctrl+Return"`。`None` 表示不模拟任何按键。
@@ -112,6 +118,8 @@ struct RawClientConfig {
     pairing_id: Option<String>,
     #[serde(default = "default_auto_paste")]
     auto_paste: bool,
+    #[serde(default)]
+    auto_paste_pic: bool,
     #[serde(default = "default_enter_after_paste")]
     enter_after_paste: bool,
     #[serde(default, alias = "emulation_key_after_paste")]
@@ -158,6 +166,7 @@ impl From<RawClientConfig> for ClientConfig {
             grpc_port,
             pairing_id: raw.pairing_id.unwrap_or_default(),
             auto_paste: raw.auto_paste,
+            auto_paste_pic: raw.auto_paste_pic,
             simulate_key_after_paste: raw.simulate_key_after_paste.or_else(|| {
                 if raw.enter_after_paste {
                     Some("Return".to_string())

@@ -387,6 +387,7 @@ impl eframe::App for App {
                                     download_max_retries: self.config.file_download_max_retries,
                                     public_base_url: self.last_public_base_url.clone(),
                                     auto_paste: self.config.auto_paste,
+                                    auto_paste_pic: self.config.auto_paste_pic,
                                     mime_type: file.mime_type.clone(),
                                     image_clipboard_max_decoded_bytes: self
                                         .config

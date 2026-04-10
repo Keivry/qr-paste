@@ -434,7 +434,11 @@ async fn handle_mobile_page(
     };
     let html = MOBILE_HTML
         .replace("__PAIRING_ID__", &pairing_id.to_string())
-        .replace("__NONCE__", &nonce);
+        .replace("__NONCE__", &nonce)
+        .replace(
+            "__MAX_UPLOAD_SIZE__",
+            &state.config.max_upload_size_bytes.to_string(),
+        );
     let mut response = Html(html).into_response();
     apply_common_headers(response.headers_mut());
     let Ok(csp_value) = HeaderValue::from_str(&format!(

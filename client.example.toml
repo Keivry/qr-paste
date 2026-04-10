@@ -1,6 +1,10 @@
 # client 会优先读取 client.exe 同目录下的 client.toml；
 # 若不存在，则回退到当前工作目录。
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 必填项
+# ──────────────────────────────────────────────────────────────────────────────
+
 # 必填：服务端主机名 / IP，或完整 gRPC 入口 URL
 # 直连示例："example.com"
 # 经 HTTPS/TLS 反向代理（如 nginx/HAProxy）示例："https://grpc.example.com"
@@ -10,6 +14,10 @@ server_host = "example.com"
 # 注意：该令牌会明文保存在本地配置文件中，请勿提交到仓库
 grpc_auth_token = "change-this-long-random-token"
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 连接设置
+# ──────────────────────────────────────────────────────────────────────────────
+
 # gRPC 端口：裸主机名 / http:// 默认 50051；https:// 默认 443；当 server_host 已显式包含端口时会被忽略
 # 如需覆盖默认值可取消注释，例如：
 # grpc_port = 50051
@@ -17,12 +25,25 @@ grpc_auth_token = "change-this-long-random-token"
 # pairing_id 会在首次启动时自动生成并写回 client.toml，用于稳定标识当前 PC；不建议手动修改
 # pairing_id = "00000000-0000-4000-8000-000000000000"
 
+# gRPC 心跳间隔（秒），默认 30；设为 0 可禁用客户端主动 Ping
+# 用于在扫码等待或已连接期间维持长连接活性
+heartbeat_interval_secs = 30
+
+# 断线或心跳异常后的最大重试退避间隔（秒），默认 60
+# 客户端会按指数退避 + 抖动自动重连，且不会超过该上限
+reconnect_max_interval_secs = 60
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 自动粘贴
+# ──────────────────────────────────────────────────────────────────────────────
+
 # 是否启用自动粘贴（收到文本后模拟 Ctrl+V），默认 false
 auto_paste = false
 
-# [已废弃] 自动粘贴后是否自动按下回车键，默认 false
-# 请改用 simulate_key_after_paste = "Return" 代替此项
-# enter_after_paste = false
+# 是否对图片文件执行自动粘贴到剪贴板，默认 false
+# 仅在 auto_paste = true 时生效；两者同时为 true 时，图片才会写入剪贴板并自动粘贴
+# 无论此项如何设置，收到的图片文件始终会保存到 file_save_dir
+# auto_paste_pic = false
 
 # 自动粘贴完成后模拟按下的按键（仅在 auto_paste = true 时生效），默认不按任何键
 # 支持格式："Return"、"Tab"、"Escape"、"Space"、"Backspace"、"Delete"
@@ -43,13 +64,18 @@ paste_delay_ms = 150
 # 仅在 auto_paste = true 且 delete_clipboard_after_paste = true 时生效
 # restore_clipboard_delay_ms = 200
 
-# gRPC 心跳间隔（秒），默认 30；设为 0 可禁用客户端主动 Ping
-# 用于在扫码等待或已连接期间维持长连接活性
-heartbeat_interval_secs = 30
+# 自动粘贴后是否还原剪贴板为粘贴前内容，默认 false
+# 仅在 auto_paste = true 时生效；粘贴后尽力还原为原始文本；
+# 若原始内容为非文本（图片等）或读取失败，还原步骤将静默跳过；此功能属最佳努力
+# delete_clipboard_after_paste = false
 
-# 断线或心跳异常后的最大重试退避间隔（秒），默认 60
-# 客户端会按指数退避 + 抖动自动重连，且不会超过该上限
-reconnect_max_interval_secs = 60
+# [已废弃] 自动粘贴后是否自动按下回车键，默认 false
+# 请改用 simulate_key_after_paste = "Return" 代替此项
+# enter_after_paste = false
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 界面 / 通知
+# ──────────────────────────────────────────────────────────────────────────────
 
 # 启动时是否最小化到托盘，默认 false
 start_minimized = false
@@ -60,10 +86,9 @@ minimize_on_close = false
 # 粘贴成功通知显示时长（秒），默认 3
 notification_duration_secs = 3
 
-# 自动粘贴后是否还原剪贴板为粘贴前内容，默认 false
-# 仅在 auto_paste = true 时生效；粘贴后尽力还原为原始文本；
-# 若原始内容为非文本（图片等）或读取失败，还原步骤将静默跳过；此功能属最佳努力
-# delete_clipboard_after_paste = false
+# ──────────────────────────────────────────────────────────────────────────────
+# 文件接收
+# ──────────────────────────────────────────────────────────────────────────────
 
 # 接收到文件时的保存目录；不设置则自动使用 %USERPROFILE%\Downloads（Windows 默认下载目录）
 # 路径支持 ~ 前缀，会自动展开为用户主目录
@@ -79,10 +104,10 @@ notification_duration_secs = 3
 # file_download_max_retries = 3
 
 # 图片解码后 RGBA 像素数据内存上限（字节），默认 209715200（200MB）
-# 当 auto_paste = true 且收到图片文件时，客户端会预估解码后内存（width × height × 4）
+# 当 auto_paste = true 且 auto_paste_pic = true 且收到图片文件时，客户端会预估解码后内存（width × height × 4）
 # 超过此阈值时跳过剪贴板路径，改为直接将图片保存到文件
 # image_clipboard_max_decoded_bytes = 209715200
 
-# 并发下载的 worker 线程数，默认 4
+# 并发下载的 worker 线程数，默认 4，必须在 1–32 之间
 # 同时接收多个文件时，将并行使用多个 worker 分别处理，避免串行队列导致背压超时
 # file_download_workers = 4

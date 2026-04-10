@@ -484,6 +484,7 @@
 
     <script nonce="__NONCE__">
     const pairingId = "__PAIRING_ID__"
+    const maxUploadSize = __MAX_UPLOAD_SIZE__
     const statusEl = document.getElementById("status")
     const inputEl = document.getElementById("input")
     const sendBtn = document.getElementById("send-btn")
@@ -951,7 +952,12 @@
     fileInput.addEventListener("change", () => {
       if (!fileInput.files || fileInput.files.length === 0) return
       let skipped = 0
+      let tooLarge = 0
       for (const file of fileInput.files) {
+        if (file.size > maxUploadSize) {
+          tooLarge++
+          continue
+        }
         const isDuplicate = selectedFiles.some(
           (entry) =>
             entry.file.name === file.name &&
@@ -963,6 +969,14 @@
         } else {
           selectedFiles.push({ file, id: nextFileId++ })
         }
+      }
+      if (tooLarge > 0) {
+        const mb = (maxUploadSize / 1024 / 1024).toFixed(0)
+        showToast(
+          tooLarge === 1
+            ? `已跳过 1 个文件（超过 ${mb} MB 限制）`
+            : `已跳过 ${tooLarge} 个文件（超过 ${mb} MB 限制）`,
+        )
       }
       if (skipped > 0) {
         showToast(skipped === 1 ? "已跳过 1 个重复文件" : `已跳过 ${skipped} 个重复文件`)
