@@ -116,6 +116,7 @@ const FALLBACK_INTERNAL_ERROR_JSON: &str =
     r#"{"type":"error","message":"服务器内部错误，请稍后重试"}"#;
 const BROWSER_SESSION_COOKIE: &str = "__Host-qr_paste_browser_session";
 const LEGACY_BROWSER_SESSION_COOKIE: &str = "qr_paste_browser_session";
+const HTTP_STREAMING_CAPABILITY: u32 = 0x01;
 
 type KeyedLimiter<K> = Arc<RateLimiter<K, DefaultKeyedStateStore<K>, DefaultClock>>;
 
@@ -160,6 +161,29 @@ struct BootstrapBody {
 
 struct BrowserAuth {
     session_id: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UploadDispatchMode {
+    HttpStreaming,
+    Streaming,
+    Relay,
+}
+
+impl UploadDispatchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HttpStreaming => "HTTP_STREAMING",
+            Self::Streaming => "STREAMING",
+            Self::Relay => "RELAY",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LateAttachOutcome {
+    RedirectToDownload,
+    NotFound,
 }
 
 #[derive(Clone)]
@@ -569,6 +593,8 @@ async fn handle_bootstrap(
         )
     };
 
+    let pc_session_notified = !notify_session_token.is_empty();
+
     if let Some(client_tx) = notify_client_tx {
         let _ = client_tx
             .send(Ok(ServerEvent {
@@ -580,6 +606,14 @@ async fn handle_bootstrap(
             }))
             .await;
     }
+
+    info!(
+        pairing_id = %pairing_id,
+        pairing_epoch = epoch,
+        client_online = online,
+        pc_session_notified,
+        "browser bootstrap succeeded"
+    );
 
     let mut response = Json(json!({
         "online": online,
@@ -694,6 +728,12 @@ async fn handle_ws_ticket(
             issued_at: now,
             expires_at: now + Duration::from_secs(15),
         },
+    );
+
+    info!(
+        pairing_id = %pairing_id,
+        pairing_epoch = epoch,
+        "websocket ticket issued"
     );
 
     let mut response = Json(json!({
@@ -868,9 +908,16 @@ async fn handle_upload(
         };
 
     let client_tx = current_client_tx(&state.store, &state.pairing_store, pairing_id);
+    let upload_mode = select_upload_dispatch_mode(client_tx.as_ref().map(|(_, caps)| *caps));
+    info!(
+        pairing_id = %pairing_id,
+        file_id = %file_id,
+        mode = upload_mode.as_str(),
+        "upload accepted"
+    );
 
-    if let Some((tx, client_capabilities)) = client_tx {
-        if client_capabilities & 0x01 != 0 {
+    match (upload_mode, client_tx) {
+        (UploadDispatchMode::HttpStreaming, Some((tx, _))) => {
             handle_upload_http_streaming(
                 state,
                 pairing_id,
@@ -886,7 +933,8 @@ async fn handle_upload(
                 body_timeout,
             )
             .await
-        } else {
+        }
+        (UploadDispatchMode::Streaming, Some((tx, _))) => {
             handle_upload_streaming(
                 state,
                 pairing_id,
@@ -903,21 +951,23 @@ async fn handle_upload(
             )
             .await
         }
-    } else {
-        handle_upload_relay(
-            state,
-            pairing_id,
-            file_id,
-            file_access_token,
-            file_name,
-            raw_filename,
-            mime_type,
-            field,
-            upload_dir,
-            max_upload_size,
-            body_timeout,
-        )
-        .await
+        (UploadDispatchMode::Relay, None) => {
+            handle_upload_relay(
+                state,
+                pairing_id,
+                file_id,
+                file_access_token,
+                file_name,
+                raw_filename,
+                mime_type,
+                field,
+                upload_dir,
+                max_upload_size,
+                body_timeout,
+            )
+            .await
+        }
+        _ => unreachable!("upload dispatch mode and client availability diverged"),
     }
 }
 
@@ -972,6 +1022,12 @@ async fn handle_upload_http_streaming(
         state.upload_store.rollback_upload(file_id, pairing_id);
         return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
     }
+
+    info!(
+        pairing_id = %pairing_id,
+        file_id = %file_id,
+        "HTTP_STREAMING upload started"
+    );
 
     let tmp_name = format!(".{file_id}.tmp");
     let tmp_path = upload_dir.join(&tmp_name);
@@ -1116,6 +1172,19 @@ async fn handle_upload_http_streaming(
         .await;
     }
 
+    let final_status = state
+        .upload_store
+        .get_file_meta(file_id)
+        .map(|meta| meta.status);
+    info!(
+        pairing_id = %pairing_id,
+        file_id = %file_id,
+        size_bytes = total_bytes,
+        stream_aborted,
+        final_status = ?final_status,
+        "HTTP_STREAMING upload finalized"
+    );
+
     let mut response = Json(json!({
         "file_id": file_id.to_string(),
         "file_name": raw_filename,
@@ -1172,6 +1241,12 @@ async fn handle_upload_streaming(
         state.upload_store.rollback_upload(file_id, pairing_id);
         return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
     }
+
+    info!(
+        pairing_id = %pairing_id,
+        file_id = %file_id,
+        "STREAMING upload started"
+    );
 
     let tmp_name = format!(".{file_id}.tmp");
     let tmp_path = upload_dir.join(&tmp_name);
@@ -1358,6 +1433,14 @@ async fn handle_upload_streaming(
         }
     }
 
+    info!(
+        pairing_id = %pairing_id,
+        file_id = %file_id,
+        size_bytes = total_bytes,
+        streaming_aborted,
+        "STREAMING upload finalized"
+    );
+
     let mut response = Json(json!({
         "file_id": file_id.to_string(),
         "file_name": raw_filename,
@@ -1462,6 +1545,13 @@ async fn handle_upload_relay(
         }
     }
 
+    info!(
+        pairing_id = %pairing_id,
+        file_id = %file_id,
+        size_bytes = meta.size_bytes,
+        "RELAY upload stored"
+    );
+
     let mut response = Json(json!({
         "file_id": file_id.to_string(),
         "file_name": raw_filename,
@@ -1543,6 +1633,13 @@ async fn handle_file_download(
     let Ok(ct_value) = HeaderValue::from_str(&meta.mime_type) else {
         return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
     };
+
+    info!(
+        file_id = %file_id,
+        size_bytes = meta.size_bytes,
+        file_status = ?meta.status,
+        "normal file download started"
+    );
 
     let mut response = (StatusCode::OK, body).into_response();
     response.headers_mut().insert(CONTENT_DISPOSITION, cd_value);
@@ -1627,14 +1724,17 @@ async fn handle_stream_download(
     }
 
     let rx = match rx {
-        Some(r) => r,
+        Some(r) => {
+            info!(file_id = %file_id, "HTTP_STREAMING stream attached");
+            r
+        }
         None => {
             // 超时：按文件状态决定 302/404
             let Some(snap) = state.upload_store.get_file_meta(file_id) else {
                 return error_json(StatusCode::NOT_FOUND, "file_not_found");
             };
-            match snap.status {
-                FileStatus::StoredUnnotified | FileStatus::Notified => {
+            match resolve_late_attach_outcome(Some(snap.status.clone())) {
+                LateAttachOutcome::RedirectToDownload => {
                     let Ok(sha_val) = HeaderValue::from_str(&snap.sha256) else {
                         return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
                     };
@@ -1648,13 +1748,20 @@ async fn handle_stream_download(
                     let Ok(location) = HeaderValue::from_str(&redirect_url) else {
                         return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
                     };
+                    info!(
+                        file_id = %file_id,
+                        file_status = ?snap.status,
+                        "HTTP_STREAMING late attach redirected to normal download"
+                    );
                     let mut resp = StatusCode::FOUND.into_response();
                     resp.headers_mut()
                         .insert(axum::http::header::LOCATION, location);
                     resp.headers_mut().insert("x-file-sha256", sha_val);
                     return resp;
                 }
-                _ => return error_json(StatusCode::NOT_FOUND, "file_not_found"),
+                LateAttachOutcome::NotFound => {
+                    return error_json(StatusCode::NOT_FOUND, "file_not_found");
+                }
             }
         }
     };
@@ -1837,6 +1944,7 @@ async fn handle_pairing_ws(
     let connection_id = Uuid::new_v4();
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     let (mobile_control_tx, mut mobile_control_rx) = mpsc::unbounded_channel();
+    let has_device_info = device_info.as_ref().is_some_and(|value| !value.is_empty());
     let handle = WsHandle {
         connection_id,
         control_tx,
@@ -1861,12 +1969,18 @@ async fn handle_pairing_ws(
         pairing_id,
         &mobile_control_tx,
     );
+    info!(
+        pairing_id = %pairing_id,
+        connection_id = %connection_id,
+        has_device_info,
+        "mobile websocket connected"
+    );
     if let Some((client_tx, _)) = current_client_tx(&state.store, &state.pairing_store, pairing_id)
     {
         let _ = client_tx
             .send(Ok(ServerEvent {
                 event: Some(Event::MobileConnected(MobileConnected {
-                    device_info: device_info.unwrap_or_default(),
+                    device_info: device_info.clone().unwrap_or_default(),
                 })),
                 grpc_session_token: String::new(),
             }))
@@ -2005,6 +2119,12 @@ async fn handle_pairing_ws(
             }))
             .await;
     }
+
+    info!(
+        pairing_id = %pairing_id,
+        connection_id = %connection_id,
+        "mobile websocket disconnected"
+    );
 }
 
 fn validate_pairing_ws(
@@ -2138,6 +2258,27 @@ fn current_client_tx(
             .clone()
             .map(|tx| (tx, session.client_capabilities))
     })
+}
+
+fn select_upload_dispatch_mode(client_capabilities: Option<u32>) -> UploadDispatchMode {
+    match client_capabilities {
+        Some(capabilities) if capabilities & HTTP_STREAMING_CAPABILITY != 0 => {
+            UploadDispatchMode::HttpStreaming
+        }
+        Some(_) => UploadDispatchMode::Streaming,
+        None => UploadDispatchMode::Relay,
+    }
+}
+
+fn resolve_late_attach_outcome(status: Option<FileStatus>) -> LateAttachOutcome {
+    match status {
+        Some(FileStatus::StoredUnnotified | FileStatus::Notified) => {
+            LateAttachOutcome::RedirectToDownload
+        }
+        Some(FileStatus::Uploading | FileStatus::Notifying | FileStatus::Acked) | None => {
+            LateAttachOutcome::NotFound
+        }
+    }
 }
 
 fn mark_mobile_ws_connected(
@@ -2287,8 +2428,9 @@ mod tests {
     use {
         super::*,
         crate::{
-            pairing::new_pairing_store,
+            pairing::{new_browser_session_store, new_pairing_store, new_ws_ticket_store},
             session::{Session, new_store},
+            upload_store::new_upload_store,
         },
         tokio::sync::mpsc,
     };
@@ -2307,6 +2449,72 @@ mod tests {
             grpc_session_token: format!("grpc-{token}"),
             client_capabilities: 0,
         }
+    }
+
+    fn test_server_config(upload_dir: std::path::PathBuf) -> ServerConfig {
+        ServerConfig {
+            public_base_url: "https://example.com".to_string(),
+            grpc_auth_token: "0123456789abcdef".to_string(),
+            grpc_port: 50051,
+            http_port: 8080,
+            http_bind_host: IpAddr::from([127, 0, 0, 1]),
+            grpc_bind_host: IpAddr::from([127, 0, 0, 1]),
+            token_expiry_secs: 300,
+            pairing_ttl_secs: 86_400,
+            token_cleanup_interval_secs: 60,
+            ws_rate_limit_per_ip_per_min: 10,
+            http_rate_limit_per_ip_per_min: 20,
+            max_ws_connections: 100,
+            max_message_size_bytes: 65_536,
+            ws_idle_timeout_secs: 90,
+            grpc_keepalive_interval_secs: 60,
+            grpc_keepalive_timeout_secs: 20,
+            log_level: "info".to_string(),
+            trusted_proxy_cidrs: Vec::new(),
+            persistence_path: "qr-paste-state.db".to_string(),
+            upload_dir,
+            max_upload_size_bytes: 52_428_800,
+            upload_file_retention_secs: 3_600,
+            upload_cleanup_interval_secs: 300,
+            upload_rate_limit_per_ip_per_min: 6,
+            upload_body_timeout_secs: 30,
+            max_pending_upload_files_per_pairing: 20,
+            max_pending_upload_files_global: 500,
+            max_pending_upload_bytes_global: 2_147_483_648,
+        }
+    }
+
+    fn test_app_state() -> AppState {
+        let upload_dir = std::env::temp_dir().join(format!("qr-paste-web-test-{}", Uuid::new_v4()));
+        let config = test_server_config(upload_dir);
+        let public_origin = config
+            .normalized_public_origin()
+            .expect("test public origin should normalize");
+        AppState {
+            store: new_store(),
+            pairing_store: new_pairing_store(),
+            browser_session_store: new_browser_session_store(),
+            ws_ticket_store: new_ws_ticket_store(),
+            config: Arc::new(config),
+            public_origin: Arc::new(public_origin),
+            ws_slots: Arc::new(Semaphore::new(100)),
+            status_limiter: keyed_limiter(30),
+            ws_ticket_limiter: keyed_limiter(12),
+            revoke_pairing_limiter: keyed_limiter(5),
+            revoke_session_limiter: keyed_limiter(10),
+            persist: None,
+            upload_store: new_upload_store(52_428_800, 20, 500, 2_147_483_648),
+        }
+    }
+
+    fn bearer_headers(token: [u8; 32]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let bearer = format!("Bearer {}", encode_hex(&token));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&bearer).expect("bearer header should be valid"),
+        );
+        headers
     }
 
     #[test]
@@ -2512,5 +2720,125 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert!(event.grpc_session_token.is_empty());
+    }
+
+    #[test]
+    fn upload_dispatch_mode_prefers_http_streaming_when_capability_present() {
+        assert_eq!(
+            select_upload_dispatch_mode(Some(HTTP_STREAMING_CAPABILITY)),
+            UploadDispatchMode::HttpStreaming
+        );
+        assert_eq!(
+            select_upload_dispatch_mode(Some(HTTP_STREAMING_CAPABILITY | 0x10)),
+            UploadDispatchMode::HttpStreaming
+        );
+    }
+
+    #[test]
+    fn upload_dispatch_mode_falls_back_for_legacy_and_offline_clients() {
+        assert_eq!(
+            select_upload_dispatch_mode(Some(0)),
+            UploadDispatchMode::Streaming
+        );
+        assert_eq!(select_upload_dispatch_mode(None), UploadDispatchMode::Relay);
+    }
+
+    #[test]
+    fn late_attach_outcome_redirects_only_for_finalized_statuses() {
+        assert_eq!(
+            resolve_late_attach_outcome(Some(FileStatus::StoredUnnotified)),
+            LateAttachOutcome::RedirectToDownload
+        );
+        assert_eq!(
+            resolve_late_attach_outcome(Some(FileStatus::Notified)),
+            LateAttachOutcome::RedirectToDownload
+        );
+    }
+
+    #[test]
+    fn late_attach_outcome_returns_not_found_for_non_finalized_statuses() {
+        assert_eq!(
+            resolve_late_attach_outcome(Some(FileStatus::Uploading)),
+            LateAttachOutcome::NotFound
+        );
+        assert_eq!(
+            resolve_late_attach_outcome(Some(FileStatus::Notifying)),
+            LateAttachOutcome::NotFound
+        );
+        assert_eq!(
+            resolve_late_attach_outcome(Some(FileStatus::Acked)),
+            LateAttachOutcome::NotFound
+        );
+        assert_eq!(
+            resolve_late_attach_outcome(None),
+            LateAttachOutcome::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_download_late_attach_redirects_to_normal_download() {
+        let state = test_app_state();
+        let pairing_id = Uuid::new_v4();
+        let (file_id, token, _file_name) = state
+            .upload_store
+            .begin_upload(pairing_id, "report.txt", "text/plain".to_string())
+            .expect("upload reservation should succeed");
+        let final_path = state.config.upload_dir.join(file_id.to_string());
+        let sha256 = [0xAB; 32];
+
+        let sender = state
+            .upload_store
+            .finalize_stream_success(file_id, final_path, 123, sha256);
+        assert!(sender.is_none());
+
+        let response = handle_stream_download(
+            Path(file_id.to_string()),
+            State(state.clone()),
+            bearer_headers(token),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            response.headers().get(axum::http::header::LOCATION),
+            Some(
+                &HeaderValue::from_str(&format!(
+                    "{}/api/files/{file_id}",
+                    state.config.public_base_url
+                ))
+                .expect("location header should be valid")
+            )
+        );
+        assert_eq!(
+            response.headers().get("x-file-sha256"),
+            Some(&HeaderValue::from_str(&encode_hex(&sha256)).expect("sha header should be valid"))
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_download_rejects_second_attach_with_conflict() {
+        let state = test_app_state();
+        let pairing_id = Uuid::new_v4();
+        let (file_id, token, _file_name) = state
+            .upload_store
+            .begin_upload(pairing_id, "report.txt", "text/plain".to_string())
+            .expect("upload reservation should succeed");
+        state
+            .upload_store
+            .create_stream_pipe(file_id)
+            .expect("stream pipe should be created");
+        let _first_receiver = state
+            .upload_store
+            .attach_stream_pipe(file_id)
+            .expect("first attach should succeed");
+
+        let response = handle_stream_download(
+            Path(file_id.to_string()),
+            State(state),
+            bearer_headers(token),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 }

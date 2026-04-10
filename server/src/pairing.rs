@@ -390,6 +390,7 @@ mod tests {
                 device_info: None,
                 pairing_id: None,
                 grpc_session_token: "grpc-token".to_string(),
+                client_capabilities: 0,
             },
         );
 
@@ -415,6 +416,7 @@ mod tests {
                 device_info: None,
                 pairing_id: None,
                 grpc_session_token: "grpc-token".to_string(),
+                client_capabilities: 0,
             },
         );
 
