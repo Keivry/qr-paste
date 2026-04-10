@@ -501,6 +501,7 @@ impl UploadStore {
                 });
             }
         }
+        self.stream_semaphores.remove(&pairing_id);
     }
 
     /// 立即删除单个文件并同步减少全局计数。
@@ -964,15 +965,24 @@ impl UploadStore {
     /// 返回 `Some(permit)` 表示成功占位；`None` 表示已达并发上限，调用方应返回 HTTP 429。
     /// 许可证在 `OwnedSemaphorePermit` drop 时自动释放。
     pub fn try_acquire_stream_permit(&self, pairing_id: Uuid) -> Option<OwnedSemaphorePermit> {
-        let sem = self
-            .stream_semaphores
-            .entry(pairing_id)
-            .or_insert_with(|| {
-                Arc::new(Semaphore::new(
-                    self.max_concurrent_http_stream_uploads_per_pairing as usize,
-                ))
-            })
-            .clone();
+        // 在持有 reservation 锁期间先检查 closed 状态，封锁与 cleanup_pairing() 的竞态：
+        // cleanup_pairing() 先标记 closed（在 Mutex 内），再 remove semaphore；
+        // 本函数先检查 closed（在 Mutex 内），若已关闭则不进入 DashMap，
+        // 两条路径在同一把锁的保护下互斥，消除"检查→创建"之间的窗口。
+        let sem = {
+            let res = self.reservation.lock().unwrap();
+            if res.is_pairing_closed(pairing_id) {
+                return None;
+            }
+            self.stream_semaphores
+                .entry(pairing_id)
+                .or_insert_with(|| {
+                    Arc::new(Semaphore::new(
+                        self.max_concurrent_http_stream_uploads_per_pairing as usize,
+                    ))
+                })
+                .clone()
+        };
         sem.try_acquire_owned().ok()
     }
 

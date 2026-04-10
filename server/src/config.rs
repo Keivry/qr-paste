@@ -389,6 +389,15 @@ impl ServerConfig {
         if self.max_pending_upload_bytes_global == 0 {
             anyhow::bail!("max_pending_upload_bytes_global 必须大于 0");
         }
+        if self.http_stream_pipe_capacity == 0 {
+            anyhow::bail!("http_stream_pipe_capacity 必须大于 0");
+        }
+        if self.http_stream_backpressure_timeout_secs == 0 {
+            anyhow::bail!("http_stream_backpressure_timeout_secs 必须大于 0");
+        }
+        if self.max_concurrent_http_stream_uploads_per_pairing == 0 {
+            anyhow::bail!("max_concurrent_http_stream_uploads_per_pairing 必须大于 0");
+        }
         Ok(())
     }
 

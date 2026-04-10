@@ -217,6 +217,9 @@ impl ClientConfig {
         if Uuid::parse_str(&self.pairing_id).is_err() {
             return Err("client.toml 中的 pairing_id 必须是合法 UUID。".to_string());
         }
+        if self.file_download_workers == 0 || self.file_download_workers > 32 {
+            return Err("file_download_workers 必须在 1–32 之间。".to_string());
+        }
         Ok(())
     }
 }
