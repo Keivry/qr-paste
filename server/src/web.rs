@@ -621,13 +621,31 @@ async fn handle_bootstrap(
     }))
     .into_response();
     apply_common_headers(response.headers_mut());
-    let Ok(cookie_value) = HeaderValue::from_str(&format!(
-        "{BROWSER_SESSION_COOKIE}={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000",
-        encode_hex(&session_id)
-    )) else {
+    let cookie_str = if state.config.debug_mode {
+        format!(
+            "{LEGACY_BROWSER_SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000",
+            encode_hex(&session_id)
+        )
+    } else {
+        format!(
+            "{BROWSER_SESSION_COOKIE}={}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=2592000",
+            encode_hex(&session_id)
+        )
+    };
+    let Ok(cookie_value) = HeaderValue::from_str(&cookie_str) else {
         return error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error");
     };
     response.headers_mut().append(SET_COOKIE, cookie_value);
+    if state.config.debug_mode {
+        // debug_mode 下写的是 legacy cookie（无 Secure）；主动清除 __Host- cookie，
+        // 防止 localhost 场景下浏览器残留旧 __Host- cookie 并在读取时优先命中它。
+        response.headers_mut().append(
+            SET_COOKIE,
+            HeaderValue::from_static(
+                "__Host-qr_paste_browser_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0",
+            ),
+        );
+    }
     response
 }
 
@@ -2481,6 +2499,7 @@ mod tests {
             max_pending_upload_files_per_pairing: 20,
             max_pending_upload_files_global: 500,
             max_pending_upload_bytes_global: 2_147_483_648,
+            debug_mode: false,
         }
     }
 

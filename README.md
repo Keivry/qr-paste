@@ -52,6 +52,7 @@ cargo build --release -p client
 | `public_base_url` | 无 (必填) | 手机访问的公网地址 (例: `https://relay.example.com`) |
 | `grpc_auth_token` | 无 (必填) | C/S 认证密钥。**明文存储，请限制文件权限且勿提交版本库** |
 | `upload_dir` | 无 (必填) | 服务端文件上传暂存目录 |
+| `debug_mode` | `false` | 允许 `http://` 及内网地址作为 `public_base_url`，仅限局域网测试。**生产环境禁止开启** |
 | `auto_paste` | `false` | 自动将文本注入当前焦点窗口 (请仅在受信场景开启) |
 | `simulate_key_after_paste` | 无 | 粘贴后模拟按键 (如 `"Return"`, `"ctrl+Return"`) |
 | `minimize_on_close` | `false` | 点击关闭按钮时隐藏到托盘而非退出 |

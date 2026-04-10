@@ -180,6 +180,15 @@ pub struct ServerConfig {
     /// 全局 pending 文件总字节数硬上限。默认 2147483648（2 GB）。超出返回 HTTP 429。
     #[serde(default = "default_max_pending_upload_bytes_global")]
     pub max_pending_upload_bytes_global: u64,
+    /// 调试模式。开启后放宽 `public_base_url` 的协议和地址限制，允许使用 `http://`
+    /// 及内网 IP（如 `http://192.168.1.100:8080`），便于在局域网中测试而无需 TLS 证书。
+    ///
+    /// ⚠️ 生产环境必须关闭此选项，否则安全机制会降级：
+    ///   - `__Host-` Cookie 前缀强制要求 HTTPS，`http://` 下浏览器不存储该 Cookie，
+    ///     导致会话鉴权切换为 legacy 非 `__Host-` Cookie（无 Secure 属性）；
+    ///   - gRPC 认证令牌以明文传输（无 TLS）。
+    #[serde(default)]
+    pub debug_mode: bool,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -246,6 +255,7 @@ impl fmt::Debug for ServerConfig {
                 "max_pending_upload_bytes_global",
                 &self.max_pending_upload_bytes_global,
             )
+            .field("debug_mode", &self.debug_mode)
             .finish()
     }
 }
@@ -301,7 +311,7 @@ impl ServerConfig {
                 "server.toml 中的 grpc_auth_token 长度不足 16 字符，请使用高熵随机值以确保安全性。"
             );
         }
-        validate_public_base_url(&self.public_base_url)?;
+        validate_public_base_url(&self.public_base_url, self.debug_mode)?;
         if self.ws_rate_limit_per_ip_per_min == 0 {
             anyhow::bail!("ws_rate_limit_per_ip_per_min 必须大于 0");
         }
@@ -382,7 +392,7 @@ fn parse_ip_header(value: Option<&str>) -> Option<IpAddr> {
         .and_then(|entry| entry.parse::<IpAddr>().ok())
 }
 
-fn validate_public_base_url(public_base_url: &str) -> anyhow::Result<()> {
+fn validate_public_base_url(public_base_url: &str, debug_mode: bool) -> anyhow::Result<()> {
     let url = Url::parse(public_base_url)
         .map_err(|err| anyhow::anyhow!("public_base_url 不是合法 URL：{err}"))?;
 
@@ -414,7 +424,7 @@ fn validate_public_base_url(public_base_url: &str) -> anyhow::Result<()> {
     };
 
     if url.scheme() == "http" {
-        if !is_loopback {
+        if !is_loopback && !debug_mode {
             anyhow::bail!(
                 "public_base_url 必须使用 https:// 协议（生产环境）；\
                  检测到非 loopback 地址的 http:// 配置"
