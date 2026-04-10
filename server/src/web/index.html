@@ -494,6 +494,23 @@
     const toastEl = document.getElementById("toast")
     const wsProto = location.protocol === "https:" ? "wss" : "ws"
 
+    const UPLOAD_ERROR_MESSAGES = {
+      rate_limited: "请求过于频繁，请稍后重试",
+      per_pairing_file_limit: "本次配对文件数已达上限",
+      global_file_limit: "服务器文件数已达上限",
+      global_byte_limit: "服务器存储空间已满",
+      too_many_uploads: "当前上传请求过多，请稍后重试",
+      pairing_closed: "配对已关闭",
+      upload_timeout: "上传超时，请重试",
+      file_too_large: "文件超过大小限制",
+      no_file_field: "请求格式错误",
+      reauth_required: "登录已过期，请重新扫码",
+      pairing_not_found: "配对不存在，请重新扫码",
+      unauthorized: "鉴权失败，请重新扫码",
+      forbidden: "请求被拒绝",
+      internal_error: "服务器内部错误，请稍后重试",
+    }
+
     const initialHash = window.location.hash
     const pairingSecret = (() => {
       const fragment = initialHash.startsWith("#ps=")
@@ -667,7 +684,7 @@
             let msg = `上传失败（${xhr.status}）`
             try {
               const data = JSON.parse(xhr.responseText)
-              if (data.error) msg = data.error
+              if (data.error) msg = UPLOAD_ERROR_MESSAGES[data.error] ?? "上传失败，请稍后重试"
             } catch (_e) {}
             entry.progressBar.style.background = "#dc3545"
             entry.statusEl.textContent = `✗ ${msg}`
@@ -933,12 +950,16 @@
         const removeBtns = document.querySelectorAll(".file-item-remove")
         for (const btn of removeBtns) btn.disabled = true
 
-        Promise.all(selectedFiles.map((entry) => uploadSingleFile(entry))).then(() => {
+        Promise.all(selectedFiles.map((entry) => uploadSingleFile(entry))).then((results) => {
           uploadInProgress = false
-          selectedFiles = []
+          const failCount = results.filter((r) => !r).length
+          selectedFiles = selectedFiles.filter((_, i) => !results[i])
           renderFileList()
           updateUploadButton(reconnectState === "connected")
           updateSendButton()
+          if (failCount > 0) {
+            showToast(failCount === 1 ? "1 个文件发送失败" : `${failCount} 个文件发送失败`)
+          }
         })
       } else {
         updateSendButton()

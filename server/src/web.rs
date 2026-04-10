@@ -107,6 +107,7 @@ use {
         governor::GovernorConfigBuilder,
         key_extractor::KeyExtractor,
     },
+    axum::body::Body as AxumBody,
     tracing::{info, warn},
     uuid::Uuid,
 };
@@ -341,37 +342,45 @@ where
     let router = Router::new()
         .route(
             "/m/{pairing_id}",
-            get(handle_mobile_page).layer(GovernorLayer::new(http_limit.clone())),
+            get(handle_mobile_page)
+                .layer(GovernorLayer::new(http_limit.clone()).error_handler(governor_rate_limit_response)),
         )
         .route(
             "/api/pairing/{pairing_id}",
-            get(handle_deprecated_pairing_get).layer(GovernorLayer::new(http_limit)),
+            get(handle_deprecated_pairing_get)
+                .layer(GovernorLayer::new(http_limit).error_handler(governor_rate_limit_response)),
         )
         .route(
             "/api/pairing/{pairing_id}/bootstrap",
-            post(handle_bootstrap).layer(GovernorLayer::new(bootstrap_limit)),
+            post(handle_bootstrap)
+                .layer(GovernorLayer::new(bootstrap_limit).error_handler(governor_rate_limit_response)),
         )
         .route(
             "/api/pairing/{pairing_id}/status",
-            post(handle_status).layer(GovernorLayer::new(status_limit.clone())),
+            post(handle_status)
+                .layer(GovernorLayer::new(status_limit.clone()).error_handler(governor_rate_limit_response)),
         )
         .route(
             "/api/pairing/{pairing_id}/ws-ticket",
-            post(handle_ws_ticket).layer(GovernorLayer::new(ws_ticket_limit)),
+            post(handle_ws_ticket)
+                .layer(GovernorLayer::new(ws_ticket_limit).error_handler(governor_rate_limit_response)),
         )
         .route(
             "/api/pairing/{pairing_id}/revoke",
-            post(handle_revoke).layer(GovernorLayer::new(revoke_limit)),
+            post(handle_revoke)
+                .layer(GovernorLayer::new(revoke_limit).error_handler(governor_rate_limit_response)),
         )
         .route(
             "/ws/mobile/{id}",
-            get(handle_ws_upgrade).layer(GovernorLayer::new(ws_limit)),
+            get(handle_ws_upgrade)
+                .layer(GovernorLayer::new(ws_limit).error_handler(governor_rate_limit_response)),
         )
         .merge(
             Router::new()
                 .route(
                     "/api/pairing/{pairing_id}/upload",
-                    post(handle_upload).layer(GovernorLayer::new(upload_limit)),
+                    post(handle_upload)
+                        .layer(GovernorLayer::new(upload_limit).error_handler(governor_rate_limit_response)),
                 )
                 .layer(DefaultBodyLimit::max(
                     (max_upload_size as usize).saturating_add(8192),
@@ -381,7 +390,8 @@ where
         .route("/api/files/{file_id}/stream", get(handle_stream_download))
         .route(
             "/api/files/{file_id}/ack",
-            post(handle_file_ack).layer(GovernorLayer::new(status_limit)),
+            post(handle_file_ack)
+                .layer(GovernorLayer::new(status_limit).error_handler(governor_rate_limit_response)),
         )
         .with_state(state);
 
@@ -1933,11 +1943,7 @@ async fn handle_ws_upgrade(
         let permit = match state.ws_slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Too many active WebSocket connections",
-                )
-                    .into_response();
+                return error_json(StatusCode::SERVICE_UNAVAILABLE, "too_many_ws_connections");
             }
         };
 
@@ -2408,6 +2414,22 @@ fn error_json(status: StatusCode, error: &str) -> Response {
     let mut response = (status, Json(json!({ "error": error }))).into_response();
     apply_common_headers(response.headers_mut());
     response
+}
+
+fn governor_rate_limit_response(err: GovernorError) -> axum::http::Response<AxumBody> {
+    match err {
+        GovernorError::TooManyRequests { .. } => {
+            error_json(StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+        }
+        GovernorError::UnableToExtractKey => {
+            warn!("governor: unable to extract rate limit key");
+            error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        }
+        GovernorError::Other { code, msg, .. } => {
+            warn!("governor: other error ({}): {:?}", code, msg);
+            error_json(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        }
+    }
 }
 
 fn apply_common_headers(headers: &mut HeaderMap) {
