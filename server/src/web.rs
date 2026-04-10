@@ -44,7 +44,7 @@ use {
     axum::{
         Json,
         Router,
-        body::Bytes,
+        body::{Body as AxumBody, Bytes},
         extract::{
             ConnectInfo,
             DefaultBodyLimit,
@@ -107,7 +107,6 @@ use {
         governor::GovernorConfigBuilder,
         key_extractor::KeyExtractor,
     },
-    axum::body::Body as AxumBody,
     tracing::{info, warn},
     uuid::Uuid,
 };
@@ -342,8 +341,9 @@ where
     let router = Router::new()
         .route(
             "/m/{pairing_id}",
-            get(handle_mobile_page)
-                .layer(GovernorLayer::new(http_limit.clone()).error_handler(governor_rate_limit_response)),
+            get(handle_mobile_page).layer(
+                GovernorLayer::new(http_limit.clone()).error_handler(governor_rate_limit_response),
+            ),
         )
         .route(
             "/api/pairing/{pairing_id}",
@@ -352,23 +352,28 @@ where
         )
         .route(
             "/api/pairing/{pairing_id}/bootstrap",
-            post(handle_bootstrap)
-                .layer(GovernorLayer::new(bootstrap_limit).error_handler(governor_rate_limit_response)),
+            post(handle_bootstrap).layer(
+                GovernorLayer::new(bootstrap_limit).error_handler(governor_rate_limit_response),
+            ),
         )
         .route(
             "/api/pairing/{pairing_id}/status",
-            post(handle_status)
-                .layer(GovernorLayer::new(status_limit.clone()).error_handler(governor_rate_limit_response)),
+            post(handle_status).layer(
+                GovernorLayer::new(status_limit.clone())
+                    .error_handler(governor_rate_limit_response),
+            ),
         )
         .route(
             "/api/pairing/{pairing_id}/ws-ticket",
-            post(handle_ws_ticket)
-                .layer(GovernorLayer::new(ws_ticket_limit).error_handler(governor_rate_limit_response)),
+            post(handle_ws_ticket).layer(
+                GovernorLayer::new(ws_ticket_limit).error_handler(governor_rate_limit_response),
+            ),
         )
         .route(
             "/api/pairing/{pairing_id}/revoke",
-            post(handle_revoke)
-                .layer(GovernorLayer::new(revoke_limit).error_handler(governor_rate_limit_response)),
+            post(handle_revoke).layer(
+                GovernorLayer::new(revoke_limit).error_handler(governor_rate_limit_response),
+            ),
         )
         .route(
             "/ws/mobile/{id}",
@@ -379,8 +384,10 @@ where
             Router::new()
                 .route(
                     "/api/pairing/{pairing_id}/upload",
-                    post(handle_upload)
-                        .layer(GovernorLayer::new(upload_limit).error_handler(governor_rate_limit_response)),
+                    post(handle_upload).layer(
+                        GovernorLayer::new(upload_limit)
+                            .error_handler(governor_rate_limit_response),
+                    ),
                 )
                 .layer(DefaultBodyLimit::max(
                     (max_upload_size as usize).saturating_add(8192),
@@ -390,8 +397,9 @@ where
         .route("/api/files/{file_id}/stream", get(handle_stream_download))
         .route(
             "/api/files/{file_id}/ack",
-            post(handle_file_ack)
-                .layer(GovernorLayer::new(status_limit).error_handler(governor_rate_limit_response)),
+            post(handle_file_ack).layer(
+                GovernorLayer::new(status_limit).error_handler(governor_rate_limit_response),
+            ),
         )
         .with_state(state);
 
@@ -1225,12 +1233,21 @@ async fn handle_upload_http_streaming(
         "HTTP_STREAMING upload finalized"
     );
 
+    // stream_aborted 表示 PC 端的 gRPC 管道在传输途中断开，实时流已终止。
+    // 文件已落盘（StoredUnnotified），但服务端不会自动补投 FileReceived 事件，
+    // 前端应将此情况提示为"未送达"，而非"稍后自动送达"。
+    let delivery_mode = if stream_aborted {
+        "relay_fallback"
+    } else {
+        "streaming"
+    };
     let mut response = Json(json!({
         "file_id": file_id.to_string(),
         "file_name": raw_filename,
         "mime_type": mime_type,
         "size_bytes": total_bytes,
         "sha256": sha256_hex,
+        "delivery_mode": delivery_mode,
     }))
     .into_response();
     apply_common_headers(response.headers_mut());
@@ -1598,6 +1615,7 @@ async fn handle_upload_relay(
         "mime_type": meta.mime_type,
         "size_bytes": meta.size_bytes,
         "sha256": meta.sha256,
+        "delivery_mode": "relay",
     }))
     .into_response();
     apply_common_headers(response.headers_mut());

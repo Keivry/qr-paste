@@ -676,9 +676,24 @@
         xhr.onload = () => {
           if (xhr.status >= 200 && xhr.status < 300) {
             entry.progressBar.style.width = "100%"
-            entry.progressBar.style.background = "#198754"
-            entry.statusEl.textContent = "✓ 已发送"
-            entry.statusEl.className = "file-item-status file-item-status-ok"
+            let deliveryMode = null
+            try {
+              const data = JSON.parse(xhr.responseText)
+              deliveryMode = data.delivery_mode ?? null
+            } catch (_e) {}
+            if (deliveryMode === "relay_fallback") {
+              entry.progressBar.style.background = "#dc3545"
+              entry.statusEl.textContent = "✗ 未能送达 PC（PC 连接中断）"
+              entry.statusEl.className = "file-item-status file-item-status-err"
+            } else if (deliveryMode === "relay") {
+              entry.progressBar.style.background = "#dc3545"
+              entry.statusEl.textContent = "✗ 未能送达 PC（PC 当前不在线）"
+              entry.statusEl.className = "file-item-status file-item-status-err"
+            } else {
+              entry.progressBar.style.background = "#198754"
+              entry.statusEl.textContent = "✓ 已送达 PC"
+              entry.statusEl.className = "file-item-status file-item-status-ok"
+            }
             resolve(true)
           } else {
             let msg = `上传失败（${xhr.status}）`
@@ -695,7 +710,14 @@
 
         xhr.onerror = () => {
           entry.progressBar.style.background = "#dc3545"
-          entry.statusEl.textContent = "✗ 网络错误"
+          entry.statusEl.textContent = "✗ 上传失败（网络错误）"
+          entry.statusEl.className = "file-item-status file-item-status-err"
+          resolve(false)
+        }
+
+        xhr.onabort = () => {
+          entry.progressBar.style.background = "#dc3545"
+          entry.statusEl.textContent = "✗ 上传已取消"
           entry.statusEl.className = "file-item-status file-item-status-err"
           resolve(false)
         }
@@ -773,6 +795,7 @@
           doCheckStatus()
         })
       } catch (_error) {
+        setStatus("网络错误，正在重连...", "connecting")
         scheduleBackoff(() => {
           reconnectState = "checking_status"
           doCheckStatus()
@@ -798,12 +821,14 @@
           doConnectWs(data.ws_ticket)
           return
         }
+        setStatus("获取连接凭据失败，正在重连...", "connecting")
         reconnectState = "backoff"
         scheduleBackoff(() => {
           reconnectState = "checking_status"
           doCheckStatus()
         })
       } catch (_error) {
+        setStatus("网络错误，正在重连...", "connecting")
         reconnectState = "backoff"
         scheduleBackoff(() => {
           reconnectState = "checking_status"
@@ -838,7 +863,9 @@
           } else if (message.type === "pong") {
             console.log("[qr-paste] pong received")
           }
-        } catch (_error) {}
+        } catch (_error) {
+          console.warn("[qr-paste] failed to parse websocket message", event.data)
+        }
       })
       ws.addEventListener("close", (event) => {
         clearHeartbeat()
@@ -849,6 +876,10 @@
           })
         } else if (event.code === 4002) {
           stopWithError("凭据已更新，请重新扫码", {
+            clearStoredPairing: true,
+          })
+        } else if (event.code === 4003) {
+          stopWithError("连接已终止，请重新扫码", {
             clearStoredPairing: true,
           })
         } else {
@@ -902,11 +933,27 @@
         setStatus("缺少配对凭据，请重新扫码", "error")
         return
       }
-      const { response, data } = await api(`/api/pairing/${pairingId}/bootstrap`, {
-        pairing_secret: pairingSecret,
-      })
+      let response, data
+      try {
+        ;({ response, data } = await api(`/api/pairing/${pairingId}/bootstrap`, {
+          pairing_secret: pairingSecret,
+        }))
+      } catch (_error) {
+        setStatus("网络错误，初始化失败，请检查网络后重试", "error")
+        return
+      }
       if (!response.ok) {
-        setStatus(response.status === 404 ? "二维码已失效，请重新扫码" : "初始化失败", "error")
+        let msg
+        if (response.status === 404) {
+          msg = "二维码已失效，请重新扫码"
+        } else if (response.status === 401 || response.status === 403) {
+          msg = "配对凭据无效，请重新扫码"
+        } else if (response.status === 429) {
+          msg = "请求过于频繁，请稍后重试"
+        } else {
+          msg = `初始化失败（${response.status}），请稍后重试`
+        }
+        setStatus(msg, "error")
         return
       }
       localStorage.setItem("qr_paste_pairing_id", pairingId)
