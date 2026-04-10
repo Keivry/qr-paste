@@ -7,7 +7,7 @@ server {
     ssl_certificate     /etc/ssl/certs/example.com.crt;
     ssl_certificate_key /etc/ssl/private/example.com.key;
 
-    location /s/ {
+    location /m/ {
         proxy_pass http://127.0.0.1:8080;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -50,4 +50,3 @@ server {
         grpc_send_timeout 3600s;
     }
 }
-
