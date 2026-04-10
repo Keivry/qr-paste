@@ -178,6 +178,7 @@ impl ClientRelay for ClientRelayService {
             device_info: None,
             pairing_id: Some(pairing_id),
             grpc_session_token: grpc_session_token.clone(),
+            client_capabilities: request.get_ref().client_capabilities,
         };
 
         self.store.insert(token.clone(), session);
@@ -546,6 +547,7 @@ mod tests {
         let request = Request::new(SubscribeRequest {
             auth_token: "wrong-token".to_string(),
             pairing_id: TEST_PAIRING_ID.to_string(),
+            ..Default::default()
         });
 
         let error = service
@@ -569,6 +571,7 @@ mod tests {
         let request = Request::new(SubscribeRequest {
             auth_token: "shared-secret-xx".to_string(),
             pairing_id: String::new(),
+            ..Default::default()
         });
 
         let error = service
@@ -594,6 +597,7 @@ mod tests {
         let request = Request::new(SubscribeRequest {
             auth_token: "shared-secret-xx".to_string(),
             pairing_id: TEST_PAIRING_ID.to_string(),
+            ..Default::default()
         });
 
         let response = service
@@ -639,6 +643,7 @@ mod tests {
         let request = Request::new(SubscribeRequest {
             auth_token: "shared-secret-xx".to_string(),
             pairing_id: TEST_PAIRING_ID.to_string(),
+            ..Default::default()
         });
 
         let response = service
@@ -683,6 +688,7 @@ mod tests {
                 device_info: Some("Phone".to_string()),
                 pairing_id: None,
                 grpc_session_token: "test-grpc-token".to_string(),
+                client_capabilities: 0,
             },
         );
 
@@ -761,6 +767,7 @@ mod tests {
                 device_info: None,
                 pairing_id: Some(pairing_id),
                 grpc_session_token: "grpc-token".to_string(),
+                client_capabilities: 0,
             },
         );
 
@@ -811,6 +818,7 @@ mod tests {
                 device_info: None,
                 pairing_id: Some(pairing_id),
                 grpc_session_token: "grpc-older".to_string(),
+                client_capabilities: 0,
             },
         );
         store.insert(
@@ -826,6 +834,7 @@ mod tests {
                 device_info: None,
                 pairing_id: Some(pairing_id),
                 grpc_session_token: "grpc-newer".to_string(),
+                client_capabilities: 0,
             },
         );
 

@@ -23,8 +23,10 @@ frontend fe_tls
     acl host_relay hdr(host) -i example.com
     acl host_grpc hdr(host) -i grpc.example.com
     acl is_mobile_ws path_beg /ws/mobile/
+    acl is_file_stream path_reg ^/api/files/[^/]+/stream$
 
     use_backend be_relay_ws if host_relay is_mobile_ws
+    use_backend be_relay_stream if host_relay is_file_stream
     use_backend be_relay_http if host_relay
     use_backend be_relay_grpc if host_grpc
 
@@ -44,8 +46,21 @@ backend be_relay_ws
     http-request set-header X-Forwarded-Host %[req.hdr(Host)]
     server relay_ws 127.0.0.1:8080 check
 
+backend be_relay_stream
+    option forwardfor
+    # http-server-close is required for chunked-transfer streaming: it keeps the
+    # client connection alive while draining the chunked response from the
+    # backend, and HAProxy does not buffer chunked bodies in this mode.
+    # timeout tunnel must be long enough to cover the full upload duration.
+    option http-server-close
+    timeout tunnel 10m
+    http-request set-header X-Forwarded-Proto https if { ssl_fc }
+    http-request set-header X-Forwarded-Host %[req.hdr(Host)]
+    server relay_stream 127.0.0.1:8080 check
+
 backend be_relay_grpc
     option forwardfor
     http-request set-header X-Forwarded-Proto https if { ssl_fc }
     http-request set-header X-Forwarded-Host %[req.hdr(Host)]
     server relay_grpc 127.0.0.1:50051 check proto h2
+

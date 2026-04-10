@@ -12,6 +12,7 @@ service ClientRelay {
 message SubscribeRequest {
   string auth_token = 1;
   string pairing_id = 2;
+  uint32 client_capabilities = 3;
 }
 
 message ServerEvent {
@@ -44,11 +45,12 @@ message ClipboardText {
 
 message Ping {}
 
-/// 文件传输模式。RELAY 表示通过服务端中继下载，P2P 为未来 P2P 直连预留，STREAMING 为 gRPC 流式直传。
+/// 文件传输模式。RELAY 表示通过服务端中继下载，P2P 为未来 P2P 直连预留，STREAMING 为 gRPC 流式直传，HTTP_STREAMING 为 HTTP chunked 流式直传。
 enum TransferMode {
   RELAY = 0;
   P2P = 1;
   STREAMING = 2;
+  HTTP_STREAMING = 3;
 }
 
 /// 服务端通过 gRPC 流向 PC 客户端推送文件接收通知。

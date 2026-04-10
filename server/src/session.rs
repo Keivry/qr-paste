@@ -49,6 +49,9 @@ pub struct Session {
     pub pairing_id: Option<Uuid>,
     /// 服务端为本次 gRPC Subscribe 会话生成的随机令牌，用于 Ping RPC 鉴权。
     pub grpc_session_token: String,
+    /// 客户端能力位掩码（来自 SubscribeRequest.client_capabilities）。
+    /// bit 0 = 0x01：支持 HTTP_STREAMING 传输模式。
+    pub client_capabilities: u32,
 }
 
 /// 线程安全的会话存储，key 为令牌字符串，value 为 [`Session`]。

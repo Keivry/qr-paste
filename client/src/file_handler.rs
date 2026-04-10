@@ -66,9 +66,50 @@ fn process_file_job(job: FileJob) -> String {
 
     let transfer_mode = TransferMode::try_from(event.transfer_mode).unwrap_or(TransferMode::Relay);
 
+    if transfer_mode == TransferMode::HttpStreaming {
+        match download_via_http_stream(event, &client) {
+            Ok((tmp_path, total_bytes)) => {
+                #[cfg(target_os = "windows")]
+                if job.auto_paste && job.mime_type.starts_with("image/") {
+                    match process_image_from_tmp(
+                        &job,
+                        &tmp_path,
+                        &dest_path,
+                        &file_name,
+                        total_bytes,
+                    ) {
+                        Ok(notice) => {
+                            send_ack(&client, event, &job.public_base_url, true);
+                            return notice;
+                        }
+                        Err(DownloadError::Terminal(msg)) | Err(DownloadError::Transient(msg)) => {
+                            send_ack(&client, event, &job.public_base_url, false);
+                            return msg;
+                        }
+                    }
+                }
+
+                match persist_tmp_as_saved_file(&tmp_path, &dest_path, &file_name, total_bytes) {
+                    Ok(notice) => {
+                        send_ack(&client, event, &job.public_base_url, true);
+                        return notice;
+                    }
+                    Err(DownloadError::Terminal(msg)) | Err(DownloadError::Transient(msg)) => {
+                        send_ack(&client, event, &job.public_base_url, false);
+                        return msg;
+                    }
+                }
+            }
+            Err(msg) => {
+                send_ack(&client, event, &job.public_base_url, false);
+                return msg;
+            }
+        }
+    }
+
     if transfer_mode == TransferMode::Streaming {
-        if let Some(channel) = job.grpc_channel {
-            match download_via_grpc_stream(event, channel, &job.file_save_dir) {
+        if let Some(ref channel) = job.grpc_channel {
+            match download_via_grpc_stream(event, channel.clone(), &job.file_save_dir) {
                 Ok((tmp_path, total_bytes)) => {
                     #[cfg(target_os = "windows")]
                     if job.auto_paste && job.mime_type.starts_with("image/") {
@@ -428,6 +469,167 @@ fn download_via_grpc_stream(
             }
         }
     })
+}
+
+fn download_via_http_stream(
+    event: &FileReceived,
+    regular_client: &reqwest::blocking::Client,
+) -> Result<(PathBuf, u64), String> {
+    let bearer = hex::encode(&event.file_access_token);
+    let file_name = event.file_name.clone();
+    let tmp_dir = std::env::temp_dir();
+
+    let no_redirect_client = match reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Err(format!("⚠ HTTP 流式下载失败（构建客户端）：{e}")),
+    };
+
+    let response = match no_redirect_client
+        .get(&event.download_url)
+        .bearer_auth(&bearer)
+        .send()
+    {
+        Ok(r) => r,
+        Err(e) => return Err(format!("⚠ HTTP 流式下载失败：{e}")),
+    };
+
+    let status = response.status();
+
+    if status == reqwest::StatusCode::FOUND {
+        let sha256_from_header = match response
+            .headers()
+            .get("x-file-sha256")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+        {
+            Some(s)
+                if !s.is_empty() && s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) =>
+            {
+                s
+            }
+            _ => return Err("⚠ HTTP 流式下载：302 响应缺少有效的 X-File-Sha256 头".to_string()),
+        };
+
+        let redirect_url = match response.headers().get(reqwest::header::LOCATION) {
+            Some(v) => match v.to_str() {
+                Ok(u) => u.to_string(),
+                Err(_) => return Err("⚠ HTTP 流式下载：302 Location 头无效".to_string()),
+            },
+            None => return Err("⚠ HTTP 流式下载：302 但无 Location 头".to_string()),
+        };
+
+        let mut relay_event = event.clone();
+        relay_event.download_url = redirect_url;
+        relay_event.sha256 = sha256_from_header;
+
+        return download_to_tmp(regular_client, &relay_event, &bearer, &tmp_dir).map_err(
+            |e| match e {
+                DownloadError::Terminal(msg) | DownloadError::Transient(msg) => msg,
+            },
+        );
+    }
+
+    if status == reqwest::StatusCode::NOT_FOUND || !status.is_success() {
+        return Err(format!("⚠ HTTP 流式下载失败：HTTP {status}"));
+    }
+
+    let tmp_path = tmp_dir.join(format!(".{}.tmp", Uuid::new_v4()));
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return Err(format!(
+                "⚠ HTTP 流式下载：无法创建临时文件 {}：{e}",
+                tmp_path.display()
+            ));
+        }
+    };
+
+    let mut hasher = Sha256::new();
+    let mut total_bytes: u64 = 0;
+    let mut ring_buf: Vec<u8> = Vec::with_capacity(32);
+    let mut response = response;
+    let mut read_buf = [0u8; 65536];
+
+    loop {
+        let n = match response.read(&mut read_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(format!("⚠ HTTP 流式下载读取失败：{e}"));
+            }
+        };
+
+        let incoming = &read_buf[..n];
+        let combined_len = ring_buf.len() + incoming.len();
+
+        if combined_len <= 32 {
+            ring_buf.extend_from_slice(incoming);
+        } else {
+            let flush_count = combined_len - 32;
+            let from_ring = flush_count.min(ring_buf.len());
+            let flush_data: Vec<u8> = ring_buf
+                .drain(..from_ring)
+                .chain(
+                    incoming[..flush_count.saturating_sub(from_ring)]
+                        .iter()
+                        .copied(),
+                )
+                .collect();
+
+            hasher.update(&flush_data);
+            total_bytes = match total_bytes.checked_add(flush_data.len() as u64) {
+                Some(v) => v,
+                None => {
+                    drop(file);
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err("⚠ HTTP 流式下载：文件大小溢出".to_string());
+                }
+            };
+            if let Err(e) = file.write_all(&flush_data) {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(format!("⚠ HTTP 流式下载写入临时文件失败：{e}"));
+            }
+
+            ring_buf.extend_from_slice(&incoming[flush_count.saturating_sub(from_ring)..]);
+        }
+    }
+
+    drop(file);
+
+    if ring_buf.len() != 32 {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(format!(
+            "⚠ HTTP 流式下载：响应体长度不足，预期末尾 32 字节 SHA-256，实际残余 {} 字节（文件 {file_name}）",
+            ring_buf.len()
+        ));
+    }
+
+    let computed: [u8; 32] = hasher.finalize().into();
+    let sha256_from_body: [u8; 32] = ring_buf.as_slice().try_into().unwrap();
+    if computed != sha256_from_body {
+        let _ = std::fs::remove_file(&tmp_path);
+        warn!(
+            expected = %hex::encode(sha256_from_body),
+            computed = %hex::encode(computed),
+            "HTTP 流式下载 SHA-256 校验失败"
+        );
+        return Err(format!(
+            "⚠ HTTP 流式下载：文件 {file_name} SHA-256 校验失败，已丢弃"
+        ));
+    }
+
+    info!(file_name = %file_name, size = total_bytes, "HTTP 流式下载完成，SHA-256 校验通过");
+    Ok((tmp_path, total_bytes))
 }
 
 fn download_to_tmp(

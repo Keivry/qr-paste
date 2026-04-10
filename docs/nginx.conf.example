@@ -22,6 +22,19 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_read_timeout 120s;
     }
+
+    location ~ ^/api/files/[^/]+/stream$ {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # HTTP_STREAMING path: disable response buffering so bytes flow to the
+        # client as they arrive from the server (upload and download proceed in
+        # parallel).  Without this, nginx would buffer the entire response body
+        # before forwarding, defeating the "streaming" purpose.
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
+    }
 }
 
 server {
@@ -37,3 +50,4 @@ server {
         grpc_send_timeout 3600s;
     }
 }
+

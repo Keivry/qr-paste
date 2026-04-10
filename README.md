@@ -99,6 +99,16 @@
 - `start_minimized = true`：启动时直接隐藏窗口，仅显示托盘图标
 - `minimize_on_close = true`：点击窗口关闭按钮时隐藏到托盘；若要真正退出，请使用托盘菜单中的“退出”
 
+## 文件传输
+
+qr-paste 支持手机端通过 multipart 上传将文件传输到 PC 客户端。当 PC 客户端在线时，采用 **HTTP_STREAMING 模式**（HTTP chunked transfer）并行传输：上传与下载同时进行，总耗时约为 `max(T_upload, T_download)`，而非串行的 `T_upload + T_download`。当 PC 客户端离线时，自动回退到 **RELAY 模式**（上传完成后写盘，PC 上线时再下载）。
+
+**文件完整性**：所有传输路径均通过 SHA-256 校验，确保文件完整性。
+
+**升级说明**：HTTP_STREAMING 模式需要 server 与 client **同时支持**该能力。旧版 client（不携带能力标识）会被 server 自动降级到 **STREAMING（gRPC 流式）** 路径，无需同步升级，向后兼容。
+
+**反向代理要求**：生产环境使用 HTTP_STREAMING 模式时，反向代理（nginx/HAProxy）**必须关闭响应缓冲**（nginx：`proxy_buffering off`），否则"边传边下"目标在生产环境不成立。详见 `docs/nginx.conf.example` 与 `docs/haproxy.cfg.example`。
+
 ## 网络要求
 
 | 端口 | 用途 | 方向 |

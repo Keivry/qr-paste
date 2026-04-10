@@ -17,7 +17,7 @@ use {
             Mutex,
             atomic::{AtomicBool, Ordering},
         },
-        time::Instant,
+        time::{Duration, Instant},
     },
     tokio::{
         io::AsyncWriteExt,
@@ -26,6 +26,45 @@ use {
     tracing::{info, warn},
     uuid::Uuid,
 };
+
+/// HTTP_STREAMING 路径的单次传输帧。
+///
+/// upload handler 按顺序发送 `Chunk` 帧，上传成功后发送 `Done` 终止帧；
+/// 上传失败时发送 `Abort` 帧。
+#[derive(Debug)]
+pub enum StreamFrame {
+    Chunk(Bytes),
+    Done { sha256: [u8; 32] },
+    Abort,
+}
+
+/// HTTP_STREAMING 路径的单文件管道，存储在 `UploadStore::stream_pipes` 中。
+struct StreamPipe {
+    tx: Sender<StreamFrame>,
+    rx: Option<Receiver<StreamFrame>>,
+}
+
+/// `create_stream_pipe()` 可能返回的错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreatePipeError {
+    AlreadyExists,
+}
+
+/// `attach_stream_pipe()` 可能返回的错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachPipeError {
+    NotFound,
+    AlreadyAttached,
+}
+
+/// `send_stream_chunk()` 的返回值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendStreamResult {
+    Ok,
+    Disconnected,
+    Timeout,
+    NotFound,
+}
 
 /// gRPC 流式推送的单个传输单元。
 ///
@@ -233,6 +272,8 @@ pub struct UploadStore {
     max_pending_upload_bytes_global: u64,
     /// STREAMING 路径：file_id → 流状态（发送/接收端 + attached 标志）。
     streaming_states: DashMap<Uuid, StreamingState>,
+    /// HTTP_STREAMING 路径：file_id → 流管道（发送/接收端）。
+    stream_pipes: DashMap<Uuid, StreamPipe>,
 }
 
 impl UploadStore {
@@ -251,6 +292,7 @@ impl UploadStore {
             max_pending_upload_files_global,
             max_pending_upload_bytes_global,
             streaming_states: DashMap::new(),
+            stream_pipes: DashMap::new(),
         })
     }
 
@@ -868,6 +910,97 @@ impl UploadStore {
 
     /// 幂等清理 StreamingState（不 panic，多次调用安全）。
     pub fn remove_streaming_state(&self, file_id: Uuid) { self.streaming_states.remove(&file_id); }
+
+    /// 为 file_id 创建 HTTP_STREAMING 管道（channel 容量 8）。
+    ///
+    /// 若 file_id 已存在 StreamPipe，返回 `Err(CreatePipeError::AlreadyExists)`，不覆盖。
+    pub fn create_stream_pipe(&self, file_id: Uuid) -> Result<(), CreatePipeError> {
+        use dashmap::mapref::entry::Entry;
+        match self.stream_pipes.entry(file_id) {
+            Entry::Occupied(_) => Err(CreatePipeError::AlreadyExists),
+            Entry::Vacant(v) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                v.insert(StreamPipe { tx, rx: Some(rx) });
+                Ok(())
+            }
+        }
+    }
+
+    /// 取走 StreamPipe 的 Receiver，交给 HTTP streaming handler。
+    ///
+    /// 在 DashMap entry 独占引用内完成 `.take()`，不存在半完成状态。
+    pub fn attach_stream_pipe(
+        &self,
+        file_id: Uuid,
+    ) -> Result<Receiver<StreamFrame>, AttachPipeError> {
+        let mut entry = self
+            .stream_pipes
+            .get_mut(&file_id)
+            .ok_or(AttachPipeError::NotFound)?;
+        entry.rx.take().ok_or(AttachPipeError::AlreadyAttached)
+    }
+
+    /// 向 HTTP_STREAMING 管道发送数据块，带 5 秒 backpressure 超时。
+    pub async fn send_stream_chunk(&self, file_id: Uuid, data: Bytes) -> SendStreamResult {
+        let tx = {
+            match self.stream_pipes.get(&file_id) {
+                Some(e) => e.tx.clone(),
+                None => return SendStreamResult::NotFound,
+            }
+        };
+        match tokio::time::timeout(Duration::from_secs(5), tx.send(StreamFrame::Chunk(data))).await
+        {
+            Ok(Ok(())) => SendStreamResult::Ok,
+            Ok(Err(_)) => SendStreamResult::Disconnected,
+            Err(_) => SendStreamResult::Timeout,
+        }
+    }
+
+    /// HTTP_STREAMING 上传完成后原子性提交：更新元数据、设置 FileStatus，
+    /// 并移除 stream_pipes 条目，返回 Sender 由调用方在锁外异步发送 Done 帧。
+    ///
+    /// 内部持 reservation 锁检查 pairing 状态，不接受外部 bool 参数。
+    ///
+    /// # 返回值
+    ///
+    /// 返回被移除的 `Sender<StreamFrame>`，调用方**必须**在锁外对其执行
+    /// `sender.send(StreamFrame::Done { sha256 }).await`（建议加超时），
+    /// 以确保 Done 帧在 channel 有背压时不被丢弃。
+    pub fn finalize_stream_success(
+        &self,
+        file_id: Uuid,
+        final_path: PathBuf,
+        actual_size: u64,
+        sha256: [u8; 32],
+    ) -> Option<Sender<StreamFrame>> {
+        let sha256_hex: String = sha256.iter().map(|b| format!("{b:02x}")).collect();
+        let removed_pipe = {
+            let mut res = self.reservation.lock().unwrap();
+            if let Some(mut entry) = self.files.get_mut(&file_id) {
+                let old_reserved = entry.size_bytes;
+                let pairing_id = entry.pairing_id;
+                let pairing_closed = res.is_pairing_closed(pairing_id);
+                entry.file_path = final_path;
+                entry.size_bytes = actual_size;
+                entry.sha256 = sha256_hex;
+                entry.status = if pairing_closed {
+                    FileStatus::StoredUnnotified
+                } else {
+                    FileStatus::Notified
+                };
+                res.correct_bytes(old_reserved, actual_size);
+            }
+            self.stream_pipes.remove(&file_id)
+        };
+        removed_pipe.map(|(_, pipe)| pipe.tx)
+    }
+
+    /// 发送 Abort 帧并移除 stream_pipes 条目；忽略发送错误。
+    pub fn abort_stream(&self, file_id: Uuid) {
+        if let Some((_, pipe)) = self.stream_pipes.remove(&file_id) {
+            let _ = pipe.tx.try_send(StreamFrame::Abort);
+        }
+    }
 
     /// RELAY 路径：接受外部已解析好的 multipart Field，
     /// 写盘、计算 SHA-256，将状态从 Uploading 更新为 StoredUnnotified。

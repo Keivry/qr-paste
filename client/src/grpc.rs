@@ -140,6 +140,7 @@ pub fn start(options: StartOptions, tx: mpsc::Sender<ClientEvent>, repaint_ctx: 
                 client.subscribe(SubscribeRequest {
                     auth_token: options.auth_token.clone(),
                     pairing_id: options.pairing_id.clone(),
+                    client_capabilities: 0x01,
                 }),
             )
             .await
