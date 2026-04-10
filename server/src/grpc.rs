@@ -525,11 +525,15 @@ mod tests {
             max_pending_upload_files_per_pairing: 20,
             max_pending_upload_files_global: 500,
             max_pending_upload_bytes_global: 2_147_483_648,
+            debug_mode: false,
+            http_stream_pipe_capacity: 8,
+            http_stream_backpressure_timeout_secs: 5,
+            max_concurrent_http_stream_uploads_per_pairing: 5,
         }
     }
 
     fn test_upload_store() -> Arc<UploadStore> {
-        new_upload_store(52_428_800, 20, 500, 2_147_483_648)
+        new_upload_store(52_428_800, 20, 500, 2_147_483_648, 8, 5, 5)
     }
 
     const TEST_PAIRING_ID: &str = "550e8400-e29b-41d4-a716-446655440000";

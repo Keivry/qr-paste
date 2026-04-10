@@ -1006,6 +1006,14 @@ async fn handle_upload_http_streaming(
 ) -> Response {
     use {futures::StreamExt as _, sha2::Digest as _, tokio::io::AsyncWriteExt as _};
 
+    let _permit = match state.upload_store.try_acquire_stream_permit(pairing_id) {
+        Some(permit) => permit,
+        None => {
+            warn!("HTTP_STREAMING 并发限制 pairing_id={pairing_id}");
+            return error_json(StatusCode::TOO_MANY_REQUESTS, "too_many_uploads");
+        }
+    };
+
     // 创建 StreamPipe（下载端通过 attach_stream_pipe 获取 rx）
     if let Err(crate::upload_store::CreatePipeError::AlreadyExists) =
         state.upload_store.create_stream_pipe(file_id)
@@ -2500,6 +2508,9 @@ mod tests {
             max_pending_upload_files_global: 500,
             max_pending_upload_bytes_global: 2_147_483_648,
             debug_mode: false,
+            http_stream_pipe_capacity: 8,
+            http_stream_backpressure_timeout_secs: 5,
+            max_concurrent_http_stream_uploads_per_pairing: 5,
         }
     }
 
@@ -2522,7 +2533,7 @@ mod tests {
             revoke_pairing_limiter: keyed_limiter(5),
             revoke_session_limiter: keyed_limiter(10),
             persist: None,
-            upload_store: new_upload_store(52_428_800, 20, 500, 2_147_483_648),
+            upload_store: new_upload_store(52_428_800, 20, 500, 2_147_483_648, 8, 5, 5),
         }
     }
 

@@ -21,7 +21,11 @@ use {
     },
     tokio::{
         io::AsyncWriteExt,
-        sync::mpsc::{Receiver, Sender},
+        sync::{
+            OwnedSemaphorePermit,
+            Semaphore,
+            mpsc::{Receiver, Sender},
+        },
     },
     tracing::{info, warn},
     uuid::Uuid,
@@ -274,6 +278,14 @@ pub struct UploadStore {
     streaming_states: DashMap<Uuid, StreamingState>,
     /// HTTP_STREAMING 路径：file_id → 流管道（发送/接收端）。
     stream_pipes: DashMap<Uuid, StreamPipe>,
+    /// HTTP_STREAMING 路径：pairing_id → 并发信号量（限制每 pairing 同时上传数）。
+    stream_semaphores: DashMap<Uuid, Arc<Semaphore>>,
+    /// HTTP_STREAMING 管道 channel 容量。
+    http_stream_pipe_capacity: usize,
+    /// HTTP_STREAMING 背压超时（秒）。
+    http_stream_backpressure_timeout_secs: u64,
+    /// 每个 pairing 允许同时进行的最大 HTTP_STREAMING 上传数量。
+    max_concurrent_http_stream_uploads_per_pairing: u32,
 }
 
 impl UploadStore {
@@ -283,6 +295,9 @@ impl UploadStore {
         max_pending_upload_files_per_pairing: u32,
         max_pending_upload_files_global: u32,
         max_pending_upload_bytes_global: u64,
+        http_stream_pipe_capacity: usize,
+        http_stream_backpressure_timeout_secs: u64,
+        max_concurrent_http_stream_uploads_per_pairing: u32,
     ) -> Arc<Self> {
         Arc::new(Self {
             files: DashMap::new(),
@@ -293,6 +308,10 @@ impl UploadStore {
             max_pending_upload_bytes_global,
             streaming_states: DashMap::new(),
             stream_pipes: DashMap::new(),
+            stream_semaphores: DashMap::new(),
+            http_stream_pipe_capacity,
+            http_stream_backpressure_timeout_secs,
+            max_concurrent_http_stream_uploads_per_pairing,
         })
     }
 
@@ -911,7 +930,7 @@ impl UploadStore {
     /// 幂等清理 StreamingState（不 panic，多次调用安全）。
     pub fn remove_streaming_state(&self, file_id: Uuid) { self.streaming_states.remove(&file_id); }
 
-    /// 为 file_id 创建 HTTP_STREAMING 管道（channel 容量 8）。
+    /// 为 file_id 创建 HTTP_STREAMING 管道（channel 容量可配置）。
     ///
     /// 若 file_id 已存在 StreamPipe，返回 `Err(CreatePipeError::AlreadyExists)`，不覆盖。
     pub fn create_stream_pipe(&self, file_id: Uuid) -> Result<(), CreatePipeError> {
@@ -919,7 +938,7 @@ impl UploadStore {
         match self.stream_pipes.entry(file_id) {
             Entry::Occupied(_) => Err(CreatePipeError::AlreadyExists),
             Entry::Vacant(v) => {
-                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                let (tx, rx) = tokio::sync::mpsc::channel(self.http_stream_pipe_capacity);
                 v.insert(StreamPipe { tx, rx: Some(rx) });
                 Ok(())
             }
@@ -940,7 +959,24 @@ impl UploadStore {
         entry.rx.take().ok_or(AttachPipeError::AlreadyAttached)
     }
 
-    /// 向 HTTP_STREAMING 管道发送数据块，带 5 秒 backpressure 超时。
+    /// 尝试为给定 pairing 获取 HTTP_STREAMING 并发许可证（非阻塞）。
+    ///
+    /// 返回 `Some(permit)` 表示成功占位；`None` 表示已达并发上限，调用方应返回 HTTP 429。
+    /// 许可证在 `OwnedSemaphorePermit` drop 时自动释放。
+    pub fn try_acquire_stream_permit(&self, pairing_id: Uuid) -> Option<OwnedSemaphorePermit> {
+        let sem = self
+            .stream_semaphores
+            .entry(pairing_id)
+            .or_insert_with(|| {
+                Arc::new(Semaphore::new(
+                    self.max_concurrent_http_stream_uploads_per_pairing as usize,
+                ))
+            })
+            .clone();
+        sem.try_acquire_owned().ok()
+    }
+
+    /// 向 HTTP_STREAMING 管道发送数据块，带可配置 backpressure 超时。
     pub async fn send_stream_chunk(&self, file_id: Uuid, data: Bytes) -> SendStreamResult {
         let tx = {
             match self.stream_pipes.get(&file_id) {
@@ -948,7 +984,11 @@ impl UploadStore {
                 None => return SendStreamResult::NotFound,
             }
         };
-        match tokio::time::timeout(Duration::from_secs(5), tx.send(StreamFrame::Chunk(data))).await
+        match tokio::time::timeout(
+            Duration::from_secs(self.http_stream_backpressure_timeout_secs),
+            tx.send(StreamFrame::Chunk(data)),
+        )
+        .await
         {
             Ok(Ok(())) => SendStreamResult::Ok,
             Ok(Err(_)) => SendStreamResult::Disconnected,
@@ -1123,12 +1163,18 @@ pub fn new_upload_store(
     max_pending_upload_files_per_pairing: u32,
     max_pending_upload_files_global: u32,
     max_pending_upload_bytes_global: u64,
+    http_stream_pipe_capacity: usize,
+    http_stream_backpressure_timeout_secs: u64,
+    max_concurrent_http_stream_uploads_per_pairing: u32,
 ) -> Arc<UploadStore> {
     UploadStore::new(
         max_upload_size_bytes,
         max_pending_upload_files_per_pairing,
         max_pending_upload_files_global,
         max_pending_upload_bytes_global,
+        http_stream_pipe_capacity,
+        http_stream_backpressure_timeout_secs,
+        max_concurrent_http_stream_uploads_per_pairing,
     )
 }
 
@@ -1207,9 +1253,13 @@ pub fn sanitize_file_name(raw: &str, fallback_id: &Uuid) -> String {
 mod tests {
     use super::*;
 
-    fn store_limit_1() -> Arc<UploadStore> { UploadStore::new(1024 * 1024 * 1024, 10, 1, u64::MAX) }
+    fn store_limit_1() -> Arc<UploadStore> {
+        UploadStore::new(1024 * 1024 * 1024, 10, 1, u64::MAX, 8, 5, 5)
+    }
 
-    fn store_loose() -> Arc<UploadStore> { UploadStore::new(1024 * 1024, 10, 100, u64::MAX) }
+    fn store_loose() -> Arc<UploadStore> {
+        UploadStore::new(1024 * 1024, 10, 100, u64::MAX, 8, 5, 5)
+    }
 
     #[test]
     fn quota_lifecycle_begin_upload_occupies_quota() {
@@ -1474,7 +1524,7 @@ mod tests {
     fn quota_byte_limit_enforced() {
         // max_upload_size_bytes=30 → 每次悲观预留 30 字节
         // max_pending_upload_bytes_global=50 → 第一次 30 ≤ 50 OK，第二次 30+30=60 > 50 FAIL
-        let store = UploadStore::new(30, 10, 100, 50);
+        let store = UploadStore::new(30, 10, 100, 50, 8, 5, 5);
         let p = Uuid::new_v4();
 
         assert!(

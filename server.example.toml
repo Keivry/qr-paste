@@ -99,6 +99,19 @@ max_pending_upload_files_global = 500
 # 注意：此为协议层硬上限，不依赖磁盘配额；建议同时配置磁盘配额作为部署层防护。
 max_pending_upload_bytes_global = 2147483648
 
+# HTTP Streaming 传输管道缓冲槽数，默认 8。
+# 增大可提升大包传输吞吐量，减小会降低内存占用；一般无需调整。
+# http_stream_pipe_capacity = 8
+
+# HTTP Streaming 背压超时（秒），默认 5。
+# 若下载端在此时间内未消费数据，服务端将终止流并标记为 stream_aborted。
+# 网络较慢或客户端处理慢时可适当调大。
+# http_stream_backpressure_timeout_secs = 5
+
+# 单 pairing 内最大并发 HTTP Streaming 上传数，默认 5。超出返回 HTTP 429。
+# 客户端会在 429 时回退到普通上传（落盘再下载）模式。
+# max_concurrent_http_stream_uploads_per_pairing = 5
+
 # ──────────────────────────────────────────────────────────────────────────────
 # 调试选项（仅限开发 / 局域网测试）
 # ──────────────────────────────────────────────────────────────────────────────

@@ -279,6 +279,32 @@
       color: var(--c-stat-err-txt);
     }
 
+    /* Toast */
+    #toast {
+      position: absolute;
+      bottom: 80px;
+      left: 50%;
+      transform: translateX(-50%) translateY(8px);
+      background: var(--c-stat-conn-bg);
+      color: var(--c-stat-conn-txt);
+      border: 1px solid #fcd34d;
+      border-radius: var(--radius-md);
+      padding: 10px 18px;
+      font-size: 13px;
+      font-weight: 500;
+      white-space: nowrap;
+      pointer-events: none;
+      opacity: 0;
+      transition:
+        opacity 0.2s ease,
+        transform 0.2s ease;
+      z-index: 10;
+    }
+    #toast.toast-visible {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+
     .file-progress-bar-wrap {
       height: 4px;
       background: var(--c-bg);
@@ -434,6 +460,8 @@
         <div id="file-list" style="display: none; margin-bottom: 10px"></div>
       </div>
 
+      <div id="toast" role="status" aria-live="polite"></div>
+
       <div class="action-area">
         <button id="add-file-btn" type="button" disabled aria-label="添加文件" title="添加文件">
           <svg
@@ -462,6 +490,7 @@
     const addFileBtn = document.getElementById("add-file-btn")
     const fileInput = document.getElementById("file-input")
     const fileListEl = document.getElementById("file-list")
+    const toastEl = document.getElementById("toast")
     const wsProto = location.protocol === "https:" ? "wss" : "ws"
 
     const initialHash = window.location.hash
@@ -489,6 +518,17 @@
     function setStatus(text, cls) {
       statusEl.textContent = text
       statusEl.className = `status-${cls}`
+    }
+
+    let toastTimer = null
+    function showToast(text) {
+      toastEl.textContent = text
+      toastEl.classList.add("toast-visible")
+      if (toastTimer !== null) clearTimeout(toastTimer)
+      toastTimer = setTimeout(() => {
+        toastEl.classList.remove("toast-visible")
+        toastTimer = null
+      }, 3000)
     }
 
     function updateSendButton() {
@@ -910,8 +950,22 @@
 
     fileInput.addEventListener("change", () => {
       if (!fileInput.files || fileInput.files.length === 0) return
+      let skipped = 0
       for (const file of fileInput.files) {
-        selectedFiles.push({ file, id: nextFileId++ })
+        const isDuplicate = selectedFiles.some(
+          (entry) =>
+            entry.file.name === file.name &&
+            entry.file.size === file.size &&
+            entry.file.lastModified === file.lastModified,
+        )
+        if (isDuplicate) {
+          skipped++
+        } else {
+          selectedFiles.push({ file, id: nextFileId++ })
+        }
+      }
+      if (skipped > 0) {
+        showToast(skipped === 1 ? "已跳过 1 个重复文件" : `已跳过 ${skipped} 个重复文件`)
       }
       renderFileList()
       fileInput.value = ""

@@ -451,7 +451,7 @@ mod tests {
             &browser_session_store,
             &ws_ticket_store,
             None,
-            &new_upload_store(52428800, 20, 500, 2147483648),
+            &new_upload_store(52428800, 20, 500, 2147483648, 8, 5, 5),
         );
 
         assert!(pairing_store.contains_key(&pairing_id));

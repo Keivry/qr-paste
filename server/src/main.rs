@@ -77,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
         cfg.max_pending_upload_files_per_pairing,
         cfg.max_pending_upload_files_global,
         cfg.max_pending_upload_bytes_global,
+        cfg.http_stream_pipe_capacity,
+        cfg.http_stream_backpressure_timeout_secs,
+        cfg.max_concurrent_http_stream_uploads_per_pairing,
     );
     let stats = upload_store.rebuild_baseline(&cfg.upload_dir, cfg.upload_file_retention_secs);
     info!(

@@ -189,6 +189,19 @@ pub struct ServerConfig {
     ///   - gRPC 认证令牌以明文传输（无 TLS）。
     #[serde(default)]
     pub debug_mode: bool,
+    /// HTTP_STREAMING 管道 channel 容量（缓冲帧数）。默认 8。
+    ///
+    /// 增大可减少背压触发频率，但会增加服务端内存占用。
+    #[serde(default = "default_http_stream_pipe_capacity")]
+    pub http_stream_pipe_capacity: usize,
+    /// HTTP_STREAMING 背压超时（秒）。默认 5。
+    ///
+    /// 发送数据块时若下游消费超过此时间，标记该流为已中止。
+    #[serde(default = "default_http_stream_backpressure_timeout_secs")]
+    pub http_stream_backpressure_timeout_secs: u64,
+    /// 每个 pairing 允许同时进行的最大 HTTP_STREAMING 上传数量。默认 5。超出返回 HTTP 429。
+    #[serde(default = "default_max_concurrent_http_stream_uploads_per_pairing")]
+    pub max_concurrent_http_stream_uploads_per_pairing: u32,
 }
 
 impl fmt::Debug for ServerConfig {
@@ -256,6 +269,15 @@ impl fmt::Debug for ServerConfig {
                 &self.max_pending_upload_bytes_global,
             )
             .field("debug_mode", &self.debug_mode)
+            .field("http_stream_pipe_capacity", &self.http_stream_pipe_capacity)
+            .field(
+                "http_stream_backpressure_timeout_secs",
+                &self.http_stream_backpressure_timeout_secs,
+            )
+            .field(
+                "max_concurrent_http_stream_uploads_per_pairing",
+                &self.max_concurrent_http_stream_uploads_per_pairing,
+            )
             .finish()
     }
 }
@@ -283,6 +305,9 @@ fn default_upload_body_timeout_secs() -> u64 { 30 }
 fn default_max_pending_upload_files_per_pairing() -> u32 { 20 }
 fn default_max_pending_upload_files_global() -> u32 { 500 }
 fn default_max_pending_upload_bytes_global() -> u64 { 2_147_483_648 }
+fn default_http_stream_pipe_capacity() -> usize { 8 }
+fn default_http_stream_backpressure_timeout_secs() -> u64 { 5 }
+fn default_max_concurrent_http_stream_uploads_per_pairing() -> u32 { 5 }
 
 impl ServerConfig {
     /// 从当前工作目录下的 `server.toml` 加载配置。

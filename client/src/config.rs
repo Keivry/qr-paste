@@ -78,6 +78,11 @@ pub struct ClientConfig {
     /// 当 `auto_paste = true` 且收到图片文件时，客户端会预估解码后内存占用（`width × height ×
     /// 4`）。 超过此阈值时跳过剪贴板路径，改为直接将图片保存到 `file_save_dir`。
     pub image_clipboard_max_decoded_bytes: u64,
+    /// 并发文件下载 worker 数量。默认 4。
+    ///
+    /// 同时接收多个文件时，最多 `file_download_workers` 个文件并行处理，
+    /// 避免单 worker 串行处理导致背压超时丢失流式传输优势。
+    pub file_download_workers: usize,
 }
 
 fn default_grpc_port() -> u16 { 50051 }
@@ -95,6 +100,7 @@ fn default_reconnect_max_interval_secs() -> u64 { 60 }
 fn default_file_download_timeout_secs() -> u64 { 60 }
 fn default_file_download_max_retries() -> u32 { 3 }
 fn default_image_clipboard_max_decoded_bytes() -> u64 { 209_715_200 }
+fn default_file_download_workers() -> usize { 4 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RawClientConfig {
@@ -136,6 +142,8 @@ struct RawClientConfig {
     file_download_max_retries: u32,
     #[serde(default = "default_image_clipboard_max_decoded_bytes")]
     image_clipboard_max_decoded_bytes: u64,
+    #[serde(default = "default_file_download_workers")]
+    file_download_workers: usize,
 }
 
 impl From<RawClientConfig> for ClientConfig {
@@ -170,6 +178,7 @@ impl From<RawClientConfig> for ClientConfig {
             file_download_timeout_secs: raw.file_download_timeout_secs,
             file_download_max_retries: raw.file_download_max_retries,
             image_clipboard_max_decoded_bytes: raw.image_clipboard_max_decoded_bytes,
+            file_download_workers: raw.file_download_workers,
         }
     }
 }

@@ -10,7 +10,11 @@ use {
     },
     egui::{Color32, Context, TextureHandle, ViewportCommand},
     std::{
-        sync::{mpsc, mpsc::TryRecvError},
+        sync::{
+            Arc,
+            Mutex,
+            mpsc::{self, TryRecvError},
+        },
         time::{Duration, Instant},
     },
     tonic::transport::Channel,
@@ -78,6 +82,10 @@ pub struct App {
     paste_notice: Option<(String, Instant)>,
     file_job_tx: Option<mpsc::SyncSender<FileJob>>,
     grpc_channel: Option<Channel>,
+    /// 序列化文件保存路径选择与 rename，避免并发 worker 产生文件名冲突。
+    file_save_lock: Arc<Mutex<()>>,
+    /// 序列化图片剪贴板写入与模拟按键，避免并发 worker 相互干扰。
+    paste_lock: Arc<Mutex<()>>,
     last_session_token: Option<String>,
     last_grpc_session_token: Option<String>,
     last_public_base_url: Option<String>,
@@ -129,7 +137,15 @@ impl App {
         tracing::info!("文件保存目录：{}", effective_file_save_dir.display());
 
         let (tx, rx) = mpsc::sync_channel::<FileJob>(64);
-        file_handler::start_file_worker(rx, clipboard_notice_tx.clone(), cc.egui_ctx.clone());
+        let num_workers = config.file_download_workers;
+        let file_save_lock = Arc::new(Mutex::new(()));
+        let paste_lock = Arc::new(Mutex::new(()));
+        file_handler::start_file_workers(
+            rx,
+            clipboard_notice_tx.clone(),
+            cc.egui_ctx.clone(),
+            num_workers,
+        );
         let file_job_tx = Some(tx);
 
         Self {
@@ -148,6 +164,8 @@ impl App {
             clipboard_notice_rx,
             file_job_tx,
             grpc_channel: None,
+            file_save_lock,
+            paste_lock,
             last_session_token: None,
             last_grpc_session_token: None,
             last_public_base_url: None,
@@ -380,6 +398,8 @@ impl eframe::App for App {
                                     paste_delay_ms: self.config.paste_delay_ms,
                                     key_after_paste_delay_ms: self.config.key_after_paste_delay_ms,
                                     grpc_channel: self.grpc_channel.clone(),
+                                    file_save_lock: Arc::clone(&self.file_save_lock),
+                                    paste_lock: Arc::clone(&self.paste_lock),
                                 };
                                 if tx.try_send(job).is_err() {
                                     tracing::warn!("文件任务队列已满，本次文件已丢弃");

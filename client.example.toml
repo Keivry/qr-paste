@@ -82,3 +82,7 @@ notification_duration_secs = 3
 # 当 auto_paste = true 且收到图片文件时，客户端会预估解码后内存（width × height × 4）
 # 超过此阈值时跳过剪贴板路径，改为直接将图片保存到文件
 # image_clipboard_max_decoded_bytes = 209715200
+
+# 并发下载的 worker 线程数，默认 4
+# 同时接收多个文件时，将并行使用多个 worker 分别处理，避免串行队列导致背压超时
+# file_download_workers = 4
